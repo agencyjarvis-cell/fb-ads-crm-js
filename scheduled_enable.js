@@ -91,7 +91,7 @@
     async function enableAdset(adsetId) {
         try {
             var _fetch = window._originalFetch || window.fetch;
-            var resp = await _fetch.call(window, '/api/adset-status', {
+            var resp = await _fetch.call(window, '/api/adsets/status', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({adset_id: adsetId, status: 'ACTIVE'})

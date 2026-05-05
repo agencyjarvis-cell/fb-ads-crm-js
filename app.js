@@ -629,6 +629,10 @@
             const isPaused = cabinetsPaused.has(cabinet.id);
             const toggleChecked = !isPaused ? 'checked' : '';
 
+            window.cabinetEnableConsent = window.cabinetEnableConsent || {};
+            const enableConsent = window.cabinetEnableConsent[cabinet.id] === true;
+            const enableConsentChecked = enableConsent ? 'checked' : '';
+
             let html = `
                 <div class="card" style="margin-bottom: 16px; border-left: 4px solid #4caf50;">
                     <div style="display: flex; justify-content: space-between; gap: 16px; align-items: center; padding: 12px;">
@@ -659,7 +663,15 @@
                                 <div style="font-size: 12px; color: var(--text-secondary);">CPL</div>
                                 <div style="font-size: 18px; font-weight: bold; color: #66bb6a;">${campaignCpl}</div>
                             </div>
-            <div class="cabinet-pause-toggle-wrapper" style="margin-left: 12px; border-left: 1px solid #e0e0e0; padding-left: 12px;" onclick="event.stopPropagation();">
+            <label title="Дозволити автоправилам ВКЛЮЧАТИ адсети цього кабінету. Без галки — лише вимкнення (по лімітам). Скидається на 00:00 за Києвом і при перезавантаженні." style="display:flex; align-items:center; gap:6px; margin-left:12px; padding:6px 10px; border:1px solid var(--border-color); border-radius:6px; background: var(--bg-primary); cursor:pointer; font-size:12px; font-weight:600; color: var(--text-primary); user-select:none;" onclick="event.stopPropagation();">
+                                <input type="checkbox"
+                                       id="cabEnableConsentTree_${cabinet.id}"
+                                       ${enableConsentChecked}
+                                       onchange="window.cabinetEnableConsent = window.cabinetEnableConsent || {}; window.cabinetEnableConsent['${cabinet.id}'] = this.checked; if (typeof window.handleCabinetEnableConsentToggle === 'function') { window.handleCabinetEnableConsentToggle('${cabinet.id}', this.checked); }"
+                                       style="width:16px; height:16px; accent-color:#e94560; cursor:pointer; margin:0;">
+                                <span>Довключення</span>
+                            </label>
+                            <div class="cabinet-pause-toggle-wrapper" style="margin-left: 12px; border-left: 1px solid #e0e0e0; padding-left: 12px;" onclick="event.stopPropagation();">
                                 <span style="font-size: 12px; color: var(--text-secondary); font-weight: 500;">АФК:</span>
                                 <label class="cabinet-pause-toggle">
                                     <input type="checkbox"
