@@ -89,15 +89,26 @@
     }
 
     function findCabinetForAdset(adsetId) {
-        var cache = window.crmCache;
-        if (!cache || !cache.length) return null;
-        for (var i = 0; i < cache.length; i++) {
-            var c = cache[i];
-            if (!c || !c.adsets) continue;
-            for (var j = 0; j < c.adsets.length; j++) {
-                var a = c.adsets[j];
-                if ((a.id || a.adset_id) === adsetId) {
-                    return c;
+        var rows = window.lastResults || window.currentMatchedRows;
+        if (!rows || !rows.length) return null;
+        for (var i = 0; i < rows.length; i++) {
+            var row = rows[i];
+            if (!row) continue;
+            if (row.adset_id === adsetId) {
+                return {
+                    id: row.adaccount_id || row.account_id,
+                    fbtool_account_id: row.fbtool_account_id
+                };
+            }
+            if (row.adsets && row.adsets.length) {
+                for (var j = 0; j < row.adsets.length; j++) {
+                    var a = row.adsets[j];
+                    if (a && (a.id === adsetId || a.adset_id === adsetId)) {
+                        return {
+                            id: row.adaccount_id || row.account_id,
+                            fbtool_account_id: row.fbtool_account_id
+                        };
+                    }
                 }
             }
         }
@@ -108,7 +119,7 @@
         try {
             var cabinet = findCabinetForAdset(adsetId);
             if (!cabinet) {
-                console.error('[TIMER] ❌ Cabinet not found in window.crmCache for adset ' + adsetId);
+                console.error('[TIMER] ❌ Cabinet not found in window.lastResults for adset ' + adsetId);
                 return false;
             }
             var rawAccountId = cabinet.id || '';
