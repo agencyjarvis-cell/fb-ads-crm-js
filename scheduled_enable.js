@@ -88,13 +88,43 @@
         return adsetId;
     }
 
+    function findCabinetForAdset(adsetId) {
+        var cache = window.crmCache;
+        if (!cache || !cache.length) return null;
+        for (var i = 0; i < cache.length; i++) {
+            var c = cache[i];
+            if (!c || !c.adsets) continue;
+            for (var j = 0; j < c.adsets.length; j++) {
+                var a = c.adsets[j];
+                if ((a.id || a.adset_id) === adsetId) {
+                    return c;
+                }
+            }
+        }
+        return null;
+    }
+
     async function enableAdset(adsetId) {
         try {
+            var cabinet = findCabinetForAdset(adsetId);
+            if (!cabinet) {
+                console.error('[TIMER] ❌ Cabinet not found in window.crmCache for adset ' + adsetId);
+                return false;
+            }
+            var rawAccountId = cabinet.id || '';
+            var normalizedAccountId = rawAccountId.replace(/^act_/, '');
+            var fbtoolAccountId = cabinet.fbtool_account_id;
+
             var _fetch = window._originalFetch || window.fetch;
             var resp = await _fetch.call(window, '/api/adsets/status', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({adset_id: adsetId, status: 'ACTIVE'})
+                body: JSON.stringify({
+                    adset_id: adsetId,
+                    adaccount_id: normalizedAccountId,
+                    fbtool_account_id: fbtoolAccountId,
+                    status: 'ACTIVE'
+                })
             });
             var data = await resp.json();
             if (data.success) {
