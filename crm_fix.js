@@ -194,16 +194,20 @@
 // Auto-load: cabinet_enable_consent + scheduled_enable + scheduled_enable_ui
 (function(){
     function loadScript(src, onload){
-        var s=document.createElement("script");
+        var s=document.createElement('script');
         s.src=src;
-        if(onload) s.onload=onload;
+        s.onload=onload||function(){};
+        s.onerror=function(){console.warn('[CRM FIX] Failed to load: '+src);};
         document.head.appendChild(s);
     }
-    // 1) consent state must exist BEFORE renderAutoRulesCabinetsList runs and BEFORE checkboxes can be clicked
-    loadScript("/static/js/cabinet_enable_consent.js");
-    // 2) timer logic
-    loadScript("/static/js/scheduled_enable.js", function(){
-        // 3) timer UI (depends on scheduled_enable.js for window._scheduledEnables)
-        loadScript("/static/js/scheduled_enable_ui.js");
+    var base='/static/js/';
+    loadScript(base+'cabinet_enable_consent.js', function(){
+        console.log('[CRM FIX] ✅ cabinet_enable_consent.js loaded');
+        loadScript(base+'scheduled_enable.js', function(){
+            console.log('[CRM FIX] ✅ scheduled_enable.js loaded');
+            loadScript(base+'scheduled_enable_ui.js', function(){
+                console.log('[CRM FIX] ✅ scheduled_enable_ui.js loaded');
+            });
+        });
     });
 })();
