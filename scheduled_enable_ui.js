@@ -225,78 +225,143 @@
         }, 1000);
     }
 
+    // ========== PROFILE GROUPING HELPERS ==========
+    var _expandedProfiles = {};
+
+    function getProfileForCab(cabId) {
+        if (!window.lastResults || !window.lastResults.length) return 'Default';
+        for (var i = 0; i < window.lastResults.length; i++) {
+            var row = window.lastResults[i];
+            if ((row.account_id || row.adaccount_id) === cabId && row.profile_name) {
+                return row.profile_name;
+            }
+        }
+        return 'Default';
+    }
+
+    function groupCabsByProfile(cabs) {
+        var profiles = {};
+        cabs.forEach(function(cab) {
+            var pName = getProfileForCab(cab.id || 'unknown');
+            if (!profiles[pName]) profiles[pName] = [];
+            profiles[pName].push(cab);
+        });
+        return profiles;
+    }
+
+    function renderCabBlock(cab) {
+        var cabId = cab.id || 'unknown';
+        var isOpen = !!_expandedCabs[cabId];
+        var cabSelCount = 0;
+        var cabTotal = 0;
+        cab.campaigns.forEach(function(c) {
+            (c.adsets || []).forEach(function(a) {
+                cabTotal++;
+                if (_selectedAdsets[a.id || a.adset_id]) cabSelCount++;
+            });
+        });
+
+        var h = '';
+        h += '<div class="timer-cab">';
+        h += '<div class="timer-cab-hdr" data-cab-id="' + cabId + '">';
+        h += '<div>';
+        h += '<span style="font-weight:700;font-size:15px;color:var(--text-primary,#333);">' + (isOpen ? '▼' : '▶') + ' ' + esc(cab.name || cabId) + '</span>';
+        if (cabSelCount > 0) h += ' <span style="color:#e94560;font-size:12px;font-weight:600;">[' + cabSelCount + ' sel]</span>';
+        h += '</div>';
+        h += '<span style="font-size:12px;color:var(--text-secondary,#888);">' + cabId + ' | ' + cab.campaigns.length + ' camp, ' + cabTotal + ' adsets</span>';
+        h += '</div>';
+
+        if (isOpen) {
+            cab.campaigns.forEach(function(camp) {
+                var campId = camp.campaign_id || camp.id || '';
+                var campSpend = (typeof calculateActualSpend === 'function') ? calculateActualSpend(camp) : (parseFloat(camp.spend) || 0);
+                var campLeads = (typeof calculateTotalLeads === 'function') ? calculateTotalLeads(camp) : (parseInt(camp.leads) || 0);
+                var campStatus = camp.campaign_status || camp.campaign_effective_status || '';
+
+                h += '<div class="timer-camp">';
+                h += '<div class="timer-camp-name">' + esc(camp.campaign_name || camp.name || 'Campaign') + '</div>';
+                h += '<div class="timer-camp-meta">';
+                h += '<span class="timer-status ' + statusClass(campStatus) + '">' + campStatus + '</span>';
+                h += ' Spend: $' + campSpend.toFixed(2) + ' | Leads: ' + campLeads;
+                h += ' <span class="timer-select-all" data-selcamp="' + campId + '">select all</span>';
+                h += '</div>';
+
+                (camp.adsets || []).forEach(function(adset) {
+                    var aId = adset.id || adset.adset_id || '';
+                    var aStatus = String(adset.status || adset.effective_status || '').toUpperCase();
+                    var checked = _selectedAdsets[aId] ? ' checked' : '';
+                    var adsKey = aId + '_ads';
+
+                    h += '<div class="timer-adset-row">';
+                    h += '<label><input type="checkbox" data-adset="' + aId + '"' + checked + '>';
+                    h += '<span>' + esc(adset.name || adset.adset_name || 'Adset') + '</span>';
+                    h += '<span class="timer-status ' + statusClass(aStatus) + '">' + aStatus + '</span>';
+                    h += '</label>';
+                    h += '</div>';
+
+                    if (adset.ads && adset.ads.length) {
+                        var adsOpen = !!_expandedAds[adsKey];
+                        h += '<div class="timer-ads-toggle" data-adskey="' + adsKey + '">' + (adsOpen ? '▼' : '▶') + ' ' + adset.ads.length + ' ads</div>';
+                        if (adsOpen) {
+                            h += '<div class="timer-ads-list">';
+                            adset.ads.forEach(function(ad) {
+                                h += '<div class="timer-ad-item">• ' + esc(ad.name || ad.ad_name || 'Ad') + ' <span style="opacity:0.6;">(' + (ad.status || '') + ')</span></div>';
+                            });
+                            h += '</div>';
+                        }
+                    }
+                });
+                h += '</div>'; // timer-camp
+            });
+        }
+        h += '</div>'; // timer-cab
+        return h;
+    }
+
     function renderSetup() {
         var cabs = getTopCampaignsByCab();
         if (!cabs.length) {
             return '<div class="timer-empty"><div style="font-size:48px;margin-bottom:12px;">📭</div>No campaign data. Load data on Step 3 first.</div>';
         }
 
+        // Group cabs by profile
+        var profileGroups = groupCabsByProfile(cabs);
+        var profileNames = Object.keys(profileGroups).sort();
+
         var h = '';
-        cabs.forEach(function(cab) {
-            var cabId = cab.id || 'unknown';
-            var isOpen = !!_expandedCabs[cabId];
-            var cabSelCount = 0;
-            var cabTotal = 0;
-            cab.campaigns.forEach(function(c) {
-                (c.adsets || []).forEach(function(a) {
-                    cabTotal++;
-                    if (_selectedAdsets[a.id || a.adset_id]) cabSelCount++;
+        profileNames.forEach(function(pName) {
+            var pCabs = profileGroups[pName];
+            var pOpen = _expandedProfiles[pName] !== false; // open by default
+            var pSelCount = 0;
+            var pTotal = 0;
+            pCabs.forEach(function(cab) {
+                cab.campaigns.forEach(function(c) {
+                    (c.adsets || []).forEach(function(a) {
+                        pTotal++;
+                        if (_selectedAdsets[a.id || a.adset_id]) pSelCount++;
+                    });
                 });
             });
 
-            h += '<div class="timer-cab">';
-            h += '<div class="timer-cab-hdr" data-cab-id="' + cabId + '">';
-            h += '<div>';
-            h += '<span style="font-weight:700;font-size:15px;color:var(--text-primary,#333);">' + (isOpen ? '▼' : '▶') + ' ' + esc(cab.name || cabId) + '</span>';
-            if (cabSelCount > 0) h += ' <span style="color:#e94560;font-size:12px;font-weight:600;">[' + cabSelCount + ' sel]</span>';
+            h += '<div style="margin-bottom:16px;">';
+            h += '<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;border-radius:10px;cursor:pointer;margin-bottom:8px;" data-profile-toggle="' + esc(pName) + '">';
+            h += '<div style="display:flex;align-items:center;gap:10px;">';
+            h += '<span style="font-size:15px;font-weight:700;">' + (pOpen ? '▼' : '▶') + ' 👤 ' + esc(pName) + '</span>';
+            h += '<span style="font-size:12px;opacity:0.85;">(' + pCabs.length + ' cabs, ' + pTotal + ' adsets)</span>';
+            if (pSelCount > 0) h += ' <span style="background:rgba(255,255,255,0.3);padding:2px 8px;border-radius:4px;font-size:11px;">' + pSelCount + ' sel</span>';
             h += '</div>';
-            h += '<span style="font-size:12px;color:var(--text-secondary,#888);">' + cabId + ' | ' + cab.campaigns.length + ' camp, ' + cabTotal + ' adsets</span>';
+            h += '<div style="display:flex;gap:8px;">';
+            h += '<span class="timer-select-all" data-selprofile="' + esc(pName) + '" style="color:#fff;font-size:12px;">Select All</span>';
+            h += '<span class="timer-select-all" data-deselprofile="' + esc(pName) + '" style="color:rgba(255,255,255,0.7);font-size:12px;">Deselect</span>';
+            h += '</div>';
             h += '</div>';
 
-            if (isOpen) {
-                cab.campaigns.forEach(function(camp) {
-                    var campId = camp.campaign_id || camp.id || '';
-                    var campSpend = (typeof calculateActualSpend === 'function') ? calculateActualSpend(camp) : (parseFloat(camp.spend) || 0);
-                    var campLeads = (typeof calculateTotalLeads === 'function') ? calculateTotalLeads(camp) : (parseInt(camp.leads) || 0);
-                    var campStatus = camp.campaign_status || camp.campaign_effective_status || '';
-
-                    h += '<div class="timer-camp">';
-                    h += '<div class="timer-camp-name">' + esc(camp.campaign_name || camp.name || 'Campaign') + '</div>';
-                    h += '<div class="timer-camp-meta">';
-                    h += '<span class="timer-status ' + statusClass(campStatus) + '">' + campStatus + '</span>';
-                    h += ' Spend: $' + campSpend.toFixed(2) + ' | Leads: ' + campLeads;
-                    h += ' <span class="timer-select-all" data-selcamp="' + campId + '">select all</span>';
-                    h += '</div>';
-
-                    (camp.adsets || []).forEach(function(adset) {
-                        var aId = adset.id || adset.adset_id || '';
-                        var aStatus = String(adset.status || adset.effective_status || '').toUpperCase();
-                        var checked = _selectedAdsets[aId] ? ' checked' : '';
-                        var adsKey = aId + '_ads';
-
-                        h += '<div class="timer-adset-row">';
-                        h += '<label><input type="checkbox" data-adset="' + aId + '"' + checked + '>';
-                        h += '<span>' + esc(adset.name || adset.adset_name || 'Adset') + '</span>';
-                        h += '<span class="timer-status ' + statusClass(aStatus) + '">' + aStatus + '</span>';
-                        h += '</label>';
-                        h += '</div>';
-
-                        if (adset.ads && adset.ads.length) {
-                            var adsOpen = !!_expandedAds[adsKey];
-                            h += '<div class="timer-ads-toggle" data-adskey="' + adsKey + '">' + (adsOpen ? '▼' : '▶') + ' ' + adset.ads.length + ' ads</div>';
-                            if (adsOpen) {
-                                h += '<div class="timer-ads-list">';
-                                adset.ads.forEach(function(ad) {
-                                    h += '<div class="timer-ad-item">• ' + esc(ad.name || ad.ad_name || 'Ad') + ' <span style="opacity:0.6;">(' + (ad.status || '') + ')</span></div>';
-                                });
-                                h += '</div>';
-                            }
-                        }
-                    });
-                    h += '</div>'; // timer-camp
+            if (pOpen) {
+                pCabs.forEach(function(cab) {
+                    h += renderCabBlock(cab);
                 });
             }
-            h += '</div>'; // timer-cab
+            h += '</div>';
         });
 
         // Controls
@@ -411,6 +476,56 @@
                             });
                         }
                     });
+                });
+                renderTimerPanel();
+            });
+        });
+
+        // Profile toggle
+        root.querySelectorAll('[data-profile-toggle]').forEach(function(el) {
+            el.addEventListener('click', function(e) {
+                if (e.target.hasAttribute('data-selprofile') || e.target.hasAttribute('data-deselprofile')) return;
+                var pName = this.getAttribute('data-profile-toggle');
+                _expandedProfiles[pName] = _expandedProfiles[pName] === false ? true : false;
+                renderTimerPanel();
+            });
+        });
+
+        // Profile select all
+        root.querySelectorAll('[data-selprofile]').forEach(function(el) {
+            el.addEventListener('click', function(e) {
+                e.stopPropagation();
+                var pName = this.getAttribute('data-selprofile');
+                var cabs = getTopCampaignsByCab();
+                cabs.forEach(function(cab) {
+                    if (getProfileForCab(cab.id || 'unknown') === pName) {
+                        cab.campaigns.forEach(function(c) {
+                            (c.adsets || []).forEach(function(a) {
+                                var aId = a.id || a.adset_id;
+                                _selectedAdsets[aId] = { name: a.name || a.adset_name || aId };
+                            });
+                        });
+                    }
+                });
+                renderTimerPanel();
+            });
+        });
+
+        // Profile deselect all
+        root.querySelectorAll('[data-deselprofile]').forEach(function(el) {
+            el.addEventListener('click', function(e) {
+                e.stopPropagation();
+                var pName = this.getAttribute('data-deselprofile');
+                var cabs = getTopCampaignsByCab();
+                cabs.forEach(function(cab) {
+                    if (getProfileForCab(cab.id || 'unknown') === pName) {
+                        cab.campaigns.forEach(function(c) {
+                            (c.adsets || []).forEach(function(a) {
+                                var aId = a.id || a.adset_id;
+                                delete _selectedAdsets[aId];
+                            });
+                        });
+                    }
                 });
                 renderTimerPanel();
             });

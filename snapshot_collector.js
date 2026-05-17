@@ -1,16 +1,13 @@
 /**
- * snapshot_collector.js — MVP Snapshot Collector for FB Ads CRM
- * Periodically captures window.lastResults into IndexedDB.
- * Computes derived metrics: CTR, CPM, CPC, CR.
- * Provides export to JSON and a minimal UI counter.
- *
- * Loaded via crm_fix.js auto-load chain.
- * v1.2 — 2026-05-11
- * + creative_id (first 4 digits of ad name before dot)
- * + geo (campaign name prefix: KGNG=KG, USM=UZ, GP=TJ)
- * + cabinet account_id at every level for easy filtering
- * + budget (adset daily_budget if available)
- * + server sync (POST snapshots to remote server)
+ * snapshot_collector.js v2.0 — Ghost campaign fix + deltas + aggregates
+ * - STRICT: only campaigns with spend>0 OR active adsets with spend>0
+ * - Strips CRM-injected leads from $0-spend campaigns (ghost fix)
+ * - Delta tracking: spend/leads change since previous snapshot
+ * - Max leads memory: prevents CRM sync drops
+ * - Top-level aggregates: total_spend, total_leads, avg_cpl
+ * - Adset name as cabinet display name
+ * - IndexedDB + optional server sync
+ * - 30 min auto-capture interval
  */
 (function() {
     'use strict';
@@ -18,17 +15,16 @@
     var DB_NAME = 'fb_ads_snapshots';
     var DB_VERSION = 1;
     var STORE_NAME = 'snapshots';
-    var INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+    var INTERVAL_MS = 30 * 60 * 1000;
     var db = null;
     var snapshotCount = 0;
     var timerId = null;
+    var lastCaptureTime = null;
 
-    // Server Sync Config
     var SERVER_URL = localStorage.getItem('snapshot_server_url') || '';
     var SERVER_TOKEN = localStorage.getItem('snapshot_server_token') || '';
     var SYNC_ENABLED = !!(SERVER_URL && SERVER_TOKEN);
 
-    // IndexedDB Setup
     function openDB(callback) {
         var req = indexedDB.open(DB_NAME, DB_VERSION);
         req.onupgradeneeded = function(e) {
@@ -47,16 +43,13 @@
                 if (callback) callback();
             });
         };
-        req.onerror = function(e) {
-            console.error('[Snapshot] DB open error:', e.target.error);
-        };
+        req.onerror = function(e) { console.error('[Snapshot] DB error:', e.target.error); };
     }
 
     function countSnapshots(callback) {
         if (!db) return callback(0);
         var tx = db.transaction(STORE_NAME, 'readonly');
-        var store = tx.objectStore(STORE_NAME);
-        var req = store.count();
+        var req = tx.objectStore(STORE_NAME).count();
         req.onsuccess = function() { callback(req.result); };
         req.onerror = function() { callback(0); };
     }
@@ -64,12 +57,12 @@
     function saveSnapshot(snapshot, callback) {
         if (!db) return;
         var tx = db.transaction(STORE_NAME, 'readwrite');
-        var store = tx.objectStore(STORE_NAME);
-        var req = store.add(snapshot);
+        var req = tx.objectStore(STORE_NAME).add(snapshot);
         req.onsuccess = function() {
             snapshotCount++;
+            lastCaptureTime = Date.now();
             updateUI();
-            console.log('[Snapshot] Saved #' + snapshotCount + ' (' + snapshot.cabinets.length + ' cabinets, ' + snapshot.total_adsets + ' adsets)');
+            console.log('[Snapshot] Saved #' + snapshotCount + ' (' + snapshot.total_cabinets + ' cabs, ' + snapshot.total_adsets + ' adsets, CPL=$' + (snapshot.avg_cpl || 'N/A') + ')');
             if (callback) callback(true);
         };
         req.onerror = function(e) {
@@ -81,64 +74,106 @@
     function getAllSnapshots(callback) {
         if (!db) return callback([]);
         var tx = db.transaction(STORE_NAME, 'readonly');
-        var store = tx.objectStore(STORE_NAME);
-        var req = store.getAll();
+        var req = tx.objectStore(STORE_NAME).getAll();
         req.onsuccess = function() { callback(req.result || []); };
         req.onerror = function() { callback([]); };
     }
 
-    // Derived Metrics
+    function deleteAllSnapshots(callback) {
+        if (!db) return;
+        var tx = db.transaction(STORE_NAME, 'readwrite');
+        tx.objectStore(STORE_NAME).clear();
+        tx.oncomplete = function() {
+            snapshotCount = 0;
+            updateUI();
+            console.log('[Snapshot] DB cleared');
+            if (callback) callback();
+        };
+    }
+
+    var prevSnapshotData = null;
+    var maxLeadsMemory = {};
+
+    function isCampaignReal(campaign) {
+        if (Number(campaign.spend) > 0) return true;
+        if (campaign.adsets && Array.isArray(campaign.adsets)) {
+            for (var i = 0; i < campaign.adsets.length; i++) {
+                if (Number(campaign.adsets[i].spend) > 0) return true;
+            }
+        }
+        return false;
+    }
+
+    function cleanLeads(campaign) {
+        if (campaign.adsets && Array.isArray(campaign.adsets)) {
+            for (var i = 0; i < campaign.adsets.length; i++) {
+                var adset = campaign.adsets[i];
+                if (Number(adset.spend) === 0) {
+                    adset.leads = 0;
+                    adset.cpl = null;
+                    if (adset.ads && Array.isArray(adset.ads)) {
+                        for (var a = 0; a < adset.ads.length; a++) {
+                            adset.ads[a].leads = 0;
+                            adset.ads[a].cpl = null;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    function getAdsetDisplayName(campaigns) {
+        for (var i = 0; i < campaigns.length; i++) {
+            var c = campaigns[i];
+            if (c.adsets && c.adsets.length > 0) {
+                for (var j = 0; j < c.adsets.length; j++) {
+                    if (Number(c.adsets[j].spend) > 0 && c.adsets[j].name) return c.adsets[j].name;
+                }
+                if (c.adsets[0].name) return c.adsets[0].name;
+            }
+        }
+        return '';
+    }
+
     function calcDerived(obj) {
         var imp = Number(obj.impressions) || 0;
         var cl = Number(obj.clicks) || 0;
         var sp = Number(obj.spend) || 0;
         var ld = Number(obj.leads) || 0;
         return {
-            ctr: imp > 0 ? round4(cl / imp * 100) : null,
-            cpm: imp > 0 ? round4(sp / imp * 1000) : null,
-            cpc: cl > 0 ? round4(sp / cl) : null,
-            cr:  cl > 0 ? round4(ld / cl * 100) : null
+            ctr: imp > 0 ? r4(cl / imp * 100) : null,
+            cpm: imp > 0 ? r4(sp / imp * 1000) : null,
+            cpc: cl > 0 ? r4(sp / cl) : null,
+            cr:  cl > 0 ? r4(ld / cl * 100) : null
         };
     }
+    function r4(n) { return Math.round(n * 10000) / 10000; }
 
-    function round4(n) {
-        return Math.round(n * 10000) / 10000;
+    var GEO_MAP = { 'KGNG': 'KG', 'USM': 'UZ', 'GP': 'TJ' };
+    function extractGeo(name) {
+        if (!name) return '';
+        var p = name.split('.')[0].split('-')[0].split('_')[0];
+        return GEO_MAP[p] || p;
+    }
+    function extractCreativeId(name) {
+        if (!name) return '';
+        var m = name.match(/^(\d{4})/);
+        return m ? m[1] : '';
     }
 
-    // Extractors
-    var GEO_MAP = {
-        'KGNG': 'KG',
-        'USM': 'UZ',
-        'GP': 'TJ'
-    };
-
-    function extractGeo(campaignName) {
-        if (!campaignName) return '';
-        var prefix = campaignName.split('.')[0].split('-')[0].split('_')[0];
-        return GEO_MAP[prefix] || prefix;
-    }
-
-    function extractCreativeId(adName) {
-        if (!adName) return '';
-        var match = adName.match(/^(\d{4})/);
-        return match ? match[1] : '';
-    }
-
-    // Snapshot Builder
     function buildSnapshot() {
         var results = window.lastResults;
-        if (!results || !Array.isArray(results) || results.length === 0) {
-            return null;
-        }
+        if (!results || !Array.isArray(results) || results.length === 0) return null;
 
         var cabinetsMap = {};
-        var totalAdsets = 0;
-        var totalAds = 0;
+        var totalAdsets = 0, totalAds = 0, ghostCampaigns = 0;
 
         for (var i = 0; i < results.length; i++) {
             var campaign = results[i];
-            var cabId = campaign.account_id || campaign.adaccount_id || 'unknown';
+            if (!isCampaignReal(campaign)) { ghostCampaigns++; continue; }
+            cleanLeads(campaign);
 
+            var cabId = campaign.account_id || campaign.adaccount_id || 'unknown';
             if (!cabinetsMap[cabId]) {
                 cabinetsMap[cabId] = {
                     account_id: cabId,
@@ -153,71 +188,57 @@
             if (campaign.adsets && Array.isArray(campaign.adsets)) {
                 for (var s = 0; s < campaign.adsets.length; s++) {
                     var adset = campaign.adsets[s];
-                    var adsetDerived = calcDerived(adset);
-
+                    var adsetSt = String(adset.status || adset.effective_status || '').toUpperCase();
+                    if (adsetSt.indexOf('ACTIVE') < 0) continue;
+                    var asd = calcDerived(adset);
                     var ads = [];
                     if (adset.ads && Array.isArray(adset.ads)) {
                         for (var a = 0; a < adset.ads.length; a++) {
                             var ad = adset.ads[a];
-                            var adDerived = calcDerived(ad);
+                            var add = calcDerived(ad);
                             ads.push({
-                                id: ad.id || '',
-                                name: ad.name || '',
+                                id: ad.id || '', name: ad.name || '',
                                 creative_id: extractCreativeId(ad.name),
-                                account_id: cabId,
-                                status: ad.status || '',
+                                account_id: cabId, status: ad.status || '',
                                 spend: Number(ad.spend) || 0,
                                 impressions: Number(ad.impressions) || 0,
                                 clicks: Number(ad.clicks) || 0,
                                 leads: Number(ad.leads) || 0,
                                 cpl: ad.cpl != null ? Number(ad.cpl) : null,
-                                ctr: adDerived.ctr,
-                                cpm: adDerived.cpm,
-                                cpc: adDerived.cpc,
-                                cr: adDerived.cr
+                                ctr: add.ctr, cpm: add.cpm, cpc: add.cpc, cr: add.cr
                             });
                             totalAds++;
                         }
                     }
-
                     adsets.push({
-                        id: adset.id || '',
-                        name: adset.name || '',
-                        account_id: cabId,
-                        status: adset.status || '',
+                        id: adset.id || '', name: adset.name || '',
+                        account_id: cabId, status: adset.status || '',
                         budget: adset.daily_budget != null ? Number(adset.daily_budget) : (adset.budget != null ? Number(adset.budget) : null),
                         spend: Number(adset.spend) || 0,
                         impressions: Number(adset.impressions) || 0,
                         clicks: Number(adset.clicks) || 0,
                         leads: Number(adset.leads) || 0,
                         cpl: adset.cpl != null ? Number(adset.cpl) : null,
-                        ctr: adsetDerived.ctr,
-                        cpm: adsetDerived.cpm,
-                        cpc: adsetDerived.cpc,
-                        cr: adsetDerived.cr,
+                        ctr: asd.ctr, cpm: asd.cpm, cpc: asd.cpc, cr: asd.cr,
                         ads: ads
                     });
                     totalAdsets++;
                 }
             }
 
-            var campDerived = calcDerived(campaign);
-            var geo = extractGeo(campaign.campaign_name);
+            var cd = calcDerived(campaign);
             cabinetsMap[cabId].campaigns.push({
                 campaign_id: campaign.campaign_id || '',
                 campaign_name: campaign.campaign_name || '',
                 campaign_status: campaign.campaign_status || '',
                 account_id: cabId,
-                geo: geo,
+                geo: extractGeo(campaign.campaign_name),
                 spend: Number(campaign.spend) || 0,
                 impressions: Number(campaign.impressions) || 0,
                 clicks: Number(campaign.clicks) || 0,
                 leads: Number(campaign.leads) || 0,
                 cpl: campaign.cpl != null ? Number(campaign.cpl) : null,
-                ctr: campDerived.ctr,
-                cpm: campDerived.cpm,
-                cpc: campDerived.cpc,
-                cr: campDerived.cr,
+                ctr: cd.ctr, cpm: cd.cpm, cpc: cd.cpc, cr: cd.cr,
                 adsets: adsets
             });
         }
@@ -225,7 +246,9 @@
         var cabinets = [];
         for (var key in cabinetsMap) {
             if (cabinetsMap.hasOwnProperty(key)) {
-                cabinets.push(cabinetsMap[key]);
+                var cab = cabinetsMap[key];
+                cab.display_name = getAdsetDisplayName(cab.campaigns);
+                cabinets.push(cab);
             }
         }
 
@@ -233,23 +256,89 @@
         if (window.lastCollectSettings && window.lastCollectSettings.date) {
             reportDate = window.lastCollectSettings.date;
         } else {
-            var dateInput = document.getElementById('dateInput');
-            if (dateInput) reportDate = dateInput.value || '';
+            var di = document.getElementById('dateInput');
+            if (di) reportDate = di.value || '';
+        }
+
+        var fbtoolTimestamp = null;
+        if (window.lastCollectTimestamp) {
+            fbtoolTimestamp = new Date(window.lastCollectTimestamp).toISOString();
+        } else if (window.lastCollectTime) {
+            fbtoolTimestamp = new Date(window.lastCollectTime).toISOString();
+        }
+
+        var aggSpend = 0, aggLeads = 0, aggClicks = 0, aggImpressions = 0;
+        for (var ci2 = 0; ci2 < cabinets.length; ci2++) {
+            for (var cj = 0; cj < cabinets[ci2].campaigns.length; cj++) {
+                var c = cabinets[ci2].campaigns[cj];
+                aggSpend += c.spend;
+                aggLeads += c.leads;
+                aggClicks += c.clicks;
+                aggImpressions += c.impressions;
+            }
+        }
+
+        var currentCampData = {};
+        for (var ci3 = 0; ci3 < cabinets.length; ci3++) {
+            for (var cj2 = 0; cj2 < cabinets[ci3].campaigns.length; cj2++) {
+                var camp2 = cabinets[ci3].campaigns[cj2];
+                var campId2 = camp2.campaign_id;
+                currentCampData[campId2] = { spend: camp2.spend, leads: camp2.leads };
+                if (maxLeadsMemory[campId2] !== undefined && maxLeadsMemory[campId2] > camp2.leads) {
+                    camp2.leads = maxLeadsMemory[campId2];
+                    camp2.cpl = camp2.leads > 0 ? r4(camp2.spend / camp2.leads) : null;
+                }
+                maxLeadsMemory[campId2] = Math.max(maxLeadsMemory[campId2] || 0, camp2.leads);
+            }
+        }
+
+        aggLeads = 0;
+        for (var ci4 = 0; ci4 < cabinets.length; ci4++) {
+            for (var cj3 = 0; cj3 < cabinets[ci4].campaigns.length; cj3++) {
+                aggLeads += cabinets[ci4].campaigns[cj3].leads;
+            }
+        }
+
+        var deltaSpend = null, deltaLeads = null;
+        if (prevSnapshotData) {
+            var prevTotalSpend = 0, prevTotalLeads = 0;
+            for (var pk in prevSnapshotData) {
+                prevTotalSpend += prevSnapshotData[pk].spend;
+                prevTotalLeads += prevSnapshotData[pk].leads;
+            }
+            deltaSpend = r4(aggSpend - prevTotalSpend);
+            deltaLeads = aggLeads - prevTotalLeads;
+        }
+
+        prevSnapshotData = {};
+        for (var dk in currentCampData) {
+            prevSnapshotData[dk] = currentCampData[dk];
+        }
+
+        if (ghostCampaigns > 0) {
+            console.log('[Snapshot] Filtered ' + ghostCampaigns + ' ghost campaigns (spend=$0 with CRM leads)');
         }
 
         return {
             timestamp: new Date().toISOString(),
+            fbtool_timestamp: fbtoolTimestamp,
             date: reportDate,
             cabinets: cabinets,
             total_cabinets: cabinets.length,
-            total_campaigns: results.length,
+            total_campaigns: cabinets.reduce(function(s,c){ return s + c.campaigns.length; }, 0),
             total_adsets: totalAdsets,
             total_ads: totalAds,
-            version: 2
+            total_spend: r4(aggSpend),
+            total_leads: aggLeads,
+            avg_cpl: aggLeads > 0 ? r4(aggSpend / aggLeads) : null,
+            avg_ctr: aggImpressions > 0 ? r4(aggClicks / aggImpressions * 100) : null,
+            delta_spend: deltaSpend,
+            delta_leads: deltaLeads,
+            ghost_campaigns_filtered: ghostCampaigns,
+            version: 4
         };
     }
 
-    // Server Sync
     function sendToServer(snapshot) {
         if (!SYNC_ENABLED) return;
         var xhr = new XMLHttpRequest();
@@ -258,23 +347,10 @@
         xhr.setRequestHeader('X-Snapshot-Token', SERVER_TOKEN);
         xhr.timeout = 15000;
         xhr.onload = function() {
-            if (xhr.status === 200) {
-                try {
-                    var resp = JSON.parse(xhr.responseText);
-                    console.log('[Snapshot] Synced to server (id=' + resp.id + ', total=' + resp.total_snapshots + ')');
-                } catch(e) {
-                    console.log('[Snapshot] Synced to server');
-                }
-            } else {
-                console.warn('[Snapshot] Server sync failed: HTTP ' + xhr.status);
-            }
+            if (xhr.status === 200) console.log('[Snapshot] Synced to server');
+            else console.warn('[Snapshot] Server sync failed: ' + xhr.status);
         };
-        xhr.onerror = function() {
-            console.warn('[Snapshot] Server sync error (network)');
-        };
-        xhr.ontimeout = function() {
-            console.warn('[Snapshot] Server sync timeout');
-        };
+        xhr.onerror = function() { console.warn('[Snapshot] Server sync error'); };
         xhr.send(JSON.stringify(snapshot));
     }
 
@@ -284,127 +360,103 @@
         SYNC_ENABLED = !!(SERVER_URL && SERVER_TOKEN);
         localStorage.setItem('snapshot_server_url', SERVER_URL);
         localStorage.setItem('snapshot_server_token', SERVER_TOKEN);
-        console.log('[Snapshot] Server sync ' + (SYNC_ENABLED ? 'ENABLED: ' + SERVER_URL : 'DISABLED'));
+        console.log('[Snapshot] Server ' + (SYNC_ENABLED ? 'ON: ' + SERVER_URL : 'OFF'));
         return SYNC_ENABLED;
     }
 
-    // Capture Logic
     function captureSnapshot() {
         var snapshot = buildSnapshot();
-        if (!snapshot) {
-            console.log('[Snapshot] Skipped - no data in window.lastResults');
-            return;
-        }
+        if (!snapshot) { console.log('[Snapshot] Skip - no active data'); return; }
+        if (snapshot.total_adsets === 0) { console.log('[Snapshot] Skip - 0 active adsets'); return; }
         saveSnapshot(snapshot);
         sendToServer(snapshot);
     }
 
     function startAutoCapture() {
         if (timerId) clearInterval(timerId);
-        timerId = setInterval(captureSnapshot, INTERVAL_MS);
-        console.log('[Snapshot] Auto-capture every ' + (INTERVAL_MS / 60000) + ' min');
+        timerId = setInterval(function() {
+            console.log('[Snapshot] Auto-capture tick');
+            captureSnapshot();
+        }, INTERVAL_MS);
+        console.log('[Snapshot] Auto every ' + (INTERVAL_MS / 60000) + ' min');
     }
 
     function stopAutoCapture() {
         if (timerId) { clearInterval(timerId); timerId = null; }
-        console.log('[Snapshot] Auto-capture stopped');
+        console.log('[Snapshot] Auto stopped');
     }
 
-    // Export
     function exportSnapshots() {
-        getAllSnapshots(function(snapshots) {
-            if (snapshots.length === 0) {
-                alert('No snapshots to export');
-                return;
-            }
-            var blob = new Blob([JSON.stringify(snapshots, null, 2)], { type: 'application/json' });
+        getAllSnapshots(function(snaps) {
+            if (snaps.length === 0) { alert('No snapshots'); return; }
+            var blob = new Blob([JSON.stringify(snaps, null, 2)], { type: 'application/json' });
             var url = URL.createObjectURL(blob);
             var a = document.createElement('a');
             a.href = url;
-            a.download = 'fb_snapshots_' + new Date().toISOString().slice(0, 10) + '.json';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
+            a.download = 'fb_snapshots_' + new Date().toISOString().slice(0,10) + '.json';
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
             URL.revokeObjectURL(url);
-            console.log('[Snapshot] Exported ' + snapshots.length + ' snapshots');
         });
     }
 
     function clearSnapshots() {
-        if (!db) return;
-        if (!confirm('Delete all snapshots? (' + snapshotCount + ')')) return;
-        var tx = db.transaction(STORE_NAME, 'readwrite');
-        var store = tx.objectStore(STORE_NAME);
-        store.clear();
-        tx.oncomplete = function() {
-            snapshotCount = 0;
-            updateUI();
-            console.log('[Snapshot] All snapshots cleared');
-        };
+        if (!confirm('Delete ALL ' + snapshotCount + ' snapshots?')) return;
+        deleteAllSnapshots();
     }
 
-    // UI
     function createUI() {
-        var container = document.createElement('div');
-        container.id = 'snapshot-widget';
-        container.style.cssText = 'position:fixed;bottom:10px;right:10px;z-index:99999;background:#1a1a2e;border:1px solid #16213e;border-radius:8px;padding:6px 10px;font-family:monospace;font-size:12px;color:#e0e0e0;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 8px rgba(0,0,0,0.3);user-select:none;transition:all 0.2s;';
-        container.title = 'Snapshot Collector';
-
-        container.innerHTML = '<span style="font-size:14px">S</span><span id="snapshot-count" style="color:#00d4ff;font-weight:bold">0</span><span style="color:#888;font-size:10px">snaps</span><span id="snapshot-status" style="width:6px;height:6px;border-radius:50%;background:#00ff88;display:inline-block" title="Active"></span>';
-
-        container.addEventListener('click', function(e) { e.stopPropagation(); toggleMenu(); });
-        container.addEventListener('mouseenter', function() { this.style.borderColor = '#00d4ff'; });
-        container.addEventListener('mouseleave', function() { this.style.borderColor = '#16213e'; });
-        document.body.appendChild(container);
+        var w = document.createElement('div');
+        w.id = 'snapshot-widget';
+        w.style.cssText = 'position:fixed;bottom:10px;right:10px;z-index:99999;background:#1a1a2e;border:1px solid #16213e;border-radius:8px;padding:6px 10px;font-family:monospace;font-size:12px;color:#e0e0e0;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 8px rgba(0,0,0,0.3);user-select:none;';
+        w.title = 'Snapshot Collector';
+        w.innerHTML = '<span style="font-size:14px">S</span><span id="snapshot-count" style="color:#00d4ff;font-weight:bold">0</span><span style="color:#888;font-size:10px">snaps</span><span id="snapshot-timer" style="color:#888;font-size:10px"></span><span id="snapshot-status" style="width:6px;height:6px;border-radius:50%;background:#00ff88;display:inline-block"></span>';
+        w.addEventListener('click', function(e) { e.stopPropagation(); toggleMenu(); });
+        document.body.appendChild(w);
 
         var menu = document.createElement('div');
         menu.id = 'snapshot-menu';
         menu.style.cssText = 'position:fixed;bottom:40px;right:10px;z-index:100000;background:#1a1a2e;border:1px solid #16213e;border-radius:8px;padding:8px;font-family:monospace;font-size:12px;color:#e0e0e0;display:none;box-shadow:0 4px 12px rgba(0,0,0,0.4);min-width:160px;';
-
-        var buttons = [
-            { text: 'Snap Now', action: captureSnapshot },
-            { text: 'Export JSON', action: exportSnapshots },
-            { text: 'Stop Auto', action: function() { stopAutoCapture(); updateUI(); } },
-            { text: 'Start Auto', action: function() { startAutoCapture(); updateUI(); } },
-            { text: 'Clear All', action: clearSnapshots }
+        var btns = [
+            { t: 'Snap Now', fn: captureSnapshot },
+            { t: 'Export JSON', fn: exportSnapshots },
+            { t: 'Stop Auto', fn: function() { stopAutoCapture(); updateUI(); } },
+            { t: 'Start Auto', fn: function() { startAutoCapture(); updateUI(); } },
+            { t: 'Clear DB', fn: clearSnapshots }
         ];
-
-        for (var i = 0; i < buttons.length; i++) {
-            var btn = document.createElement('div');
-            btn.textContent = buttons[i].text;
-            btn.style.cssText = 'padding:5px 8px;cursor:pointer;border-radius:4px;margin:2px 0;';
-            btn.addEventListener('mouseenter', function() { this.style.background = '#16213e'; });
-            btn.addEventListener('mouseleave', function() { this.style.background = 'transparent'; });
-            (function(action) {
-                btn.addEventListener('click', function(e) {
-                    e.stopPropagation();
-                    action();
-                    menu.style.display = 'none';
-                });
-            })(buttons[i].action);
-            menu.appendChild(btn);
+        for (var i = 0; i < btns.length; i++) {
+            var b = document.createElement('div');
+            b.textContent = btns[i].t;
+            b.style.cssText = 'padding:5px 8px;cursor:pointer;border-radius:4px;margin:2px 0;';
+            b.addEventListener('mouseenter', function() { this.style.background = '#16213e'; });
+            b.addEventListener('mouseleave', function() { this.style.background = 'transparent'; });
+            (function(fn) { b.addEventListener('click', function(e) { e.stopPropagation(); fn(); menu.style.display = 'none'; }); })(btns[i].fn);
+            menu.appendChild(b);
         }
-
         document.body.appendChild(menu);
         document.addEventListener('click', function() { menu.style.display = 'none'; });
+        setInterval(updateTimerDisplay, 60000);
     }
 
     function toggleMenu() {
-        var menu = document.getElementById('snapshot-menu');
-        if (menu) { menu.style.display = menu.style.display === 'none' ? 'block' : 'none'; }
+        var m = document.getElementById('snapshot-menu');
+        if (m) m.style.display = m.style.display === 'none' ? 'block' : 'none';
     }
 
     function updateUI() {
-        var countEl = document.getElementById('snapshot-count');
-        if (countEl) countEl.textContent = snapshotCount;
-        var statusEl = document.getElementById('snapshot-status');
-        if (statusEl) {
-            statusEl.style.background = timerId ? '#00ff88' : '#ff4444';
-            statusEl.title = timerId ? 'Auto-capture active' : 'Auto-capture stopped';
-        }
+        var c = document.getElementById('snapshot-count');
+        if (c) c.textContent = snapshotCount;
+        var s = document.getElementById('snapshot-status');
+        if (s) { s.style.background = timerId ? '#00ff88' : '#ff4444'; }
+        updateTimerDisplay();
     }
 
-    // Console API
+    function updateTimerDisplay() {
+        var el = document.getElementById('snapshot-timer');
+        if (!el || !lastCaptureTime) return;
+        var mins = Math.round((Date.now() - lastCaptureTime) / 60000);
+        el.textContent = mins + 'm ago';
+    }
+
     window.snapshotAPI = {
         capture: captureSnapshot,
         export: exportSnapshots,
@@ -413,18 +465,25 @@
         stop: stopAutoCapture,
         count: function() { return snapshotCount; },
         getAll: getAllSnapshots,
-        setInterval: function(minutes) {
-            INTERVAL_MS = minutes * 60 * 1000;
+        deleteAll: deleteAllSnapshots,
+        setInterval: function(min) {
+            INTERVAL_MS = min * 60 * 1000;
             if (timerId) { stopAutoCapture(); startAutoCapture(); }
-            console.log('[Snapshot] Interval set to ' + minutes + ' min');
+            console.log('[Snapshot] Interval: ' + min + ' min');
         },
         server: configureServer,
-        syncStatus: function() {
-            return { enabled: SYNC_ENABLED, url: SERVER_URL, hasToken: !!SERVER_TOKEN };
+        syncStatus: function() { return { enabled: SYNC_ENABLED, url: SERVER_URL }; },
+        status: function() {
+            return {
+                count: snapshotCount,
+                autoActive: !!timerId,
+                intervalMin: INTERVAL_MS / 60000,
+                lastCapture: lastCaptureTime ? new Date(lastCaptureTime).toLocaleTimeString() : 'never',
+                serverSync: SYNC_ENABLED
+            };
         }
     };
 
-    // Init
     openDB(function() {
         createUI();
         startAutoCapture();
@@ -435,5 +494,5 @@
         }, 10000);
     });
 
-    console.log('[Snapshot Collector v1.2] Loaded - auto-capture every 30 min, IndexedDB + server sync');
+    console.log('[Snapshot v2.0] Ghost fix + deltas + max_leads + aggregates, 30min, IndexedDB + server sync');
 })();

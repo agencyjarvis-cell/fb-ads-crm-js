@@ -18,6 +18,98 @@
     if (!window._scheduledEnables) window._scheduledEnables = {};
     if (!window._retryQueue) window._retryQueue = {};
 
+    // ========== localStorage PERSISTENCE ==========
+    var LS_KEY = 'crm_scheduled_timers';
+
+    function saveTimersToStorage() {
+        try {
+            var data = {};
+            var timers = window._scheduledEnables;
+            for (var id in timers) {
+                if (!timers.hasOwnProperty(id)) continue;
+                var t = timers[id];
+                data[id] = {
+                    kyivTimeISO: t.time.toISOString(),
+                    label: t.label,
+                    adsetName: t.adsetName,
+                    batchId: t.batchId || null
+                };
+            }
+            localStorage.setItem(LS_KEY, JSON.stringify(data));
+            console.log('[TIMER] Saved ' + Object.keys(data).length + ' timers to localStorage');
+        } catch(e) {
+            console.warn('[TIMER] localStorage save failed:', e.message);
+        }
+    }
+
+    function restoreTimersFromStorage() {
+        try {
+            var raw = localStorage.getItem(LS_KEY);
+            if (!raw) return;
+            var data = JSON.parse(raw);
+            var restored = 0;
+            var expired = 0;
+
+            // Group entries by batchId (or singleton) and bucket by absolute time.
+            var batches = {};  // batchKey -> { kyivTime, ids: [], delayMs, batchId }
+            for (var id in data) {
+                if (!data.hasOwnProperty(id)) continue;
+                var entry = data[id];
+                var kyivTime = new Date(entry.kyivTimeISO);
+                var kyivNow = getKyivNow();
+                var delayMs = kyivTime.getTime() - kyivNow.getTime();
+
+                if (delayMs <= 0) { expired++; continue; }
+
+                var key = entry.batchId ? ('batch:' + entry.batchId) : ('single:' + id);
+                if (!batches[key]) {
+                    batches[key] = { kyivTime: kyivTime, delayMs: delayMs, batchId: entry.batchId || null, ids: [], names: {}, labels: {} };
+                }
+                batches[key].ids.push(id);
+                batches[key].names[id] = entry.adsetName || id;
+                batches[key].labels[id] = entry.label || formatKyiv(kyivTime) + ' Kyiv';
+            }
+
+            for (var key in batches) {
+                if (!batches.hasOwnProperty(key)) continue;
+                var b = batches[key];
+                var timerId = (function(bRef) {
+                    return setTimeout(function() {
+                        var memberIds = bRef.ids.filter(function(mid) {
+                            return window._scheduledEnables[mid];
+                        });
+                        console.log('[TIMER] Restored ' + (bRef.batchId ? 'batch' : 'timer') +
+                                    ' fired for ' + memberIds.length + '/' + bRef.ids.length + ' adsets');
+                        if (memberIds.length) executeEnablesBatch(memberIds);
+                    }, bRef.delayMs);
+                })(b);
+
+                b.ids.forEach(function(mid) {
+                    window._scheduledEnables[mid] = {
+                        time: b.kyivTime,
+                        timerId: timerId,
+                        batchId: b.batchId,
+                        label: b.labels[mid],
+                        adsetName: b.names[mid]
+                    };
+                    restored++;
+                });
+            }
+
+            if (expired > 0) {
+                saveTimersToStorage();
+            }
+            if (restored > 0) {
+                console.log('[TIMER] Restored ' + restored + ' timers from localStorage (' + expired + ' expired)');
+            }
+        } catch(e) {
+            console.warn('[TIMER] localStorage restore failed:', e.message);
+        }
+    }
+
+    // Restore on load
+    restoreTimersFromStorage();
+
     function getKyivNow() {
         var now = new Date();
         var kyivMs = now.getTime() + (now.getTimezoneOffset() * 60000) + (KYIV_OFFSET * 3600000);
@@ -196,6 +288,7 @@
         }
 
         console.log('[TIMER] Batch done: ' + succeeded + ' ok, ' + failedCount + ' failed' + (retrying > 0 ? ' (' + retrying + ' retrying)' : ''));
+        saveTimersToStorage();
     }
 
     // === PUBLIC API ===
@@ -230,6 +323,7 @@
 
         var delayMin = Math.round(parsed.delayMs / 60000);
         console.log('[TIMER] Scheduled: ' + adsetName + ' at ' + formatKyiv(parsed.kyivTime) + ' Kyiv (in ' + delayMin + ' min)');
+        saveTimersToStorage();
         return {adsetId: adsetId, name: adsetName, enableAt: formatKyiv(parsed.kyivTime), inMinutes: delayMin};
     };
 
@@ -245,25 +339,36 @@
             return;
         }
 
-        // Single timer for whole batch → serial execution inside
+        // Batch ID — each adset entry references it. Cancelling one entry just
+        // removes its membership; the batch fires whatever entries remain.
+        var batchId = 'batch_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+
         var timerId = setTimeout(function() {
-            console.log('[TIMER] Batch timer fired for ' + adsetIds.length + ' adsets at ' + formatKyiv(getKyivNow()) + ' Kyiv');
-            executeEnablesBatch(adsetIds);
+            var memberIds = [];
+            for (var id in window._scheduledEnables) {
+                if (window._scheduledEnables[id] && window._scheduledEnables[id].batchId === batchId) {
+                    memberIds.push(id);
+                }
+            }
+            console.log('[TIMER] Batch timer fired for ' + memberIds.length + '/' + adsetIds.length + ' remaining adsets at ' + formatKyiv(getKyivNow()) + ' Kyiv');
+            if (memberIds.length) executeEnablesBatch(memberIds);
         }, parsed.delayMs);
 
-        // Register each adset
+        // Register each adset with shared batchId + the same timerId reference
         for (var i = 0; i < adsetIds.length; i++) {
             var name = findAdsetName(adsetIds[i]);
             window._scheduledEnables[adsetIds[i]] = {
                 time: parsed.kyivTime,
                 timerId: timerId,
+                batchId: batchId,
                 label: formatKyiv(parsed.kyivTime) + ' Kyiv',
                 adsetName: name
             };
         }
 
         var delayMin = Math.round(parsed.delayMs / 60000);
-        console.log('[TIMER] Batch scheduled: ' + adsetIds.length + ' adsets at ' + formatKyiv(parsed.kyivTime) + ' Kyiv (in ' + delayMin + ' min, serial ' + (ENABLE_GAP_MS/1000) + 's gap)');
+        console.log('[TIMER] Batch scheduled: ' + adsetIds.length + ' adsets at ' + formatKyiv(parsed.kyivTime) + ' Kyiv (in ' + delayMin + ' min, serial ' + (ENABLE_GAP_MS/1000) + 's gap, batch=' + batchId + ')');
+        saveTimersToStorage();
     };
 
     window.listScheduled = function() {
@@ -296,9 +401,27 @@
     window.cancelScheduled = function(adsetId) {
         var found = false;
         if (window._scheduledEnables[adsetId]) {
-            clearTimeout(window._scheduledEnables[adsetId].timerId);
-            console.log('[TIMER] Cancelled schedule: ' + window._scheduledEnables[adsetId].adsetName);
-            delete window._scheduledEnables[adsetId];
+            var entry = window._scheduledEnables[adsetId];
+            // If this is a batch entry, only clear the timer when no peers remain.
+            if (entry.batchId) {
+                delete window._scheduledEnables[adsetId];
+                var peers = 0;
+                for (var pid in window._scheduledEnables) {
+                    if (window._scheduledEnables[pid] && window._scheduledEnables[pid].batchId === entry.batchId) {
+                        peers++;
+                    }
+                }
+                if (peers === 0) {
+                    clearTimeout(entry.timerId);
+                    console.log('[TIMER] Cancelled batch (last member): ' + entry.adsetName);
+                } else {
+                    console.log('[TIMER] Cancelled batch member: ' + entry.adsetName + ' (' + peers + ' peers remain)');
+                }
+            } else {
+                clearTimeout(entry.timerId);
+                console.log('[TIMER] Cancelled schedule: ' + entry.adsetName);
+                delete window._scheduledEnables[adsetId];
+            }
             found = true;
         }
         if (window._retryQueue[adsetId]) {
@@ -308,17 +431,26 @@
             found = true;
         }
         if (!found) console.log('[TIMER] No schedule/retry found for ' + adsetId);
+        if (found) saveTimersToStorage();
         return found;
     };
 
     window.cancelAllScheduled = function() {
         var sKeys = Object.keys(window._scheduledEnables);
         var rKeys = Object.keys(window._retryQueue);
-        sKeys.forEach(function(id) { clearTimeout(window._scheduledEnables[id].timerId); });
+        var clearedTimers = {};
+        sKeys.forEach(function(id) {
+            var tid = window._scheduledEnables[id].timerId;
+            if (tid && !clearedTimers[tid]) {
+                clearTimeout(tid);
+                clearedTimers[tid] = true;
+            }
+        });
         rKeys.forEach(function(id) { clearTimeout(window._retryQueue[id].retryTimerId); });
         window._scheduledEnables = {};
         window._retryQueue = {};
         console.log('[TIMER] All cancelled (' + sKeys.length + ' schedules, ' + rKeys.length + ' retries).');
+        saveTimersToStorage();
         return sKeys.length + rKeys.length;
     };
 
