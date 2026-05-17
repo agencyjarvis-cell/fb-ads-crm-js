@@ -10,6 +10,15 @@
                 if(body.refresh_crm===true){body.refresh_crm=false;options=Object.assign({},options,{body:JSON.stringify(body)});}
             }catch(e){}
         }
+        if(typeof url==="string"&&url.includes("/api/rate-limit-stats")){
+            return _originalFetch.call(this,url,options).then(function(resp){
+                return resp.json().then(function(data){
+                    if(data.stats){data.stats.max_per_minute=30;data.stats.available_slots=30-data.stats.requests_last_minute;}
+                    data.usage_percent=((data.stats?data.stats.requests_last_minute:0)/30)*100;
+                    return new Response(JSON.stringify(data),{status:200,headers:{"Content-Type":"application/json"}});
+                });
+            });
+        }
         return _originalFetch.call(this,url,options);
     };
     async function fetchCrmData(){
@@ -127,38 +136,65 @@
             alert("CRM оновлено!");
         }catch(e){if(typeof hideLoading==="function")hideLoading();if(typeof releaseLock==="function")releaseLock();alert("Помилка: "+e.message);}
     };
-    async function checkReEnableAdsets(){
-        if(!window.lastResults||!window.autoRulesV2Settings)return;
-        if(!window.autoRulesV2DisabledAdsets||Object.keys(window.autoRulesV2DisabledAdsets).length===0)return;
-        var settings=window.autoRulesV2Settings;
-        for(var ci=0;ci<window.lastResults.length;ci++){
-            var campaign=window.lastResults[ci];if(!campaign.adsets)continue;
-            for(var si=0;si<campaign.adsets.length;si++){
-                var adset=campaign.adsets[si];var adsetId=adset.id||adset.adset_id;
-                if(!adsetId||!window.autoRulesV2DisabledAdsets[adsetId])continue;
-                var leads=parseInt(adset.leads)||0;var spend=parseFloat(adset.spend)||0;
-                if(leads===0||spend===0)continue;
-                var cpl=spend/leads;var maxSpend=null;
-                if(leads>=4){
-                    var targetCpl=parseFloat(settings.disable_rules&&settings.disable_rules.max_cpl)||4;
-                    if(typeof window.getRulesForCabinet==="function"){
-                        try{var rules=window.getRulesForCabinet(campaign.account_id||campaign.adaccount_id);
-                            if(rules&&rules.target_cpl_4plus)targetCpl=parseFloat(rules.target_cpl_4plus);}catch(e){}
-                    }
-                    maxSpend=leads*targetCpl;
-                }
-                if(maxSpend!==null&&spend<maxSpend){
-                    console.log("[CRM FIX v3] Re-enable "+adsetId+": "+leads+" leads, CPL $"+cpl.toFixed(2));
-                    if(typeof window.checkAdsetEnableRule==="function"){
-                        try{await window.checkAdsetEnableRule(adsetId,adset);}catch(e){}
-                    }else{
-                        try{await _originalFetch.call(window,"/api/adset-status",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({adset_id:adsetId,status:"ACTIVE"})});
-                            delete window.autoRulesV2DisabledAdsets[adsetId];
-                        }catch(e){}
-                    }
+    // Track adsets disabled by autorules (since app.js Set is not exported to window)
+    if(!window._crmFixDisabledAdsets) window._crmFixDisabledAdsets={};
+    // Hook: intercept disable/enable API calls to track disabled adsets
+    (function(){
+        var _prevFetch=window.fetch;
+        window.fetch=function(url,options){
+            if(typeof url==="string"&&url.includes("/api/adsets/status")&&options&&options.body){
+                try{var b=JSON.parse(options.body);
+                    if(b.status==="PAUSED"&&b.adset_id){window._crmFixDisabledAdsets[b.adset_id]={at:Date.now()};console.log("[CRM FIX] Tracked disable: "+b.adset_id);}
+                    if(b.status==="ACTIVE"&&b.adset_id){delete window._crmFixDisabledAdsets[b.adset_id];console.log("[CRM FIX] Tracked enable: "+b.adset_id);}
+                }catch(e){}
+            }
+            return _prevFetch.apply(this,arguments);
+        };
+    })();
+
+    function getTargetCpl(cabinetId){
+        var settings=window.autoRulesV2Settings;if(!settings)return 4;
+        if(settings.groups&&settings.groups.length){
+            for(var g=0;g<settings.groups.length;g++){
+                var group=settings.groups[g];
+                if(group.cabinets&&group.cabinets.indexOf(cabinetId)!==-1){
+                    if(group.rules&&group.rules.target_cpl_after_3)return parseFloat(group.rules.target_cpl_after_3);
+                    if(group.rules&&group.rules.target_cpl_4plus)return parseFloat(group.rules.target_cpl_4plus);
                 }
             }
         }
+        var dr=settings.default_rules||settings;
+        return parseFloat(dr.target_cpl_after_3||dr.target_cpl_4plus||dr.max_cpl)||4;
+    }
+
+    async function checkReEnableAdsets(){
+        if(!window.lastResults||!window.autoRulesV2Settings)return;
+        var disabled=window._crmFixDisabledAdsets;
+        if(!disabled||Object.keys(disabled).length===0)return;
+        var reEnabled=0;
+        for(var ci=0;ci<window.lastResults.length;ci++){
+            var campaign=window.lastResults[ci];if(!campaign.adsets)continue;
+            var cabinetId=campaign.account_id||campaign.adaccount_id||'';
+            var fbtoolId=campaign.fbtool_account_id||'';
+            for(var si=0;si<campaign.adsets.length;si++){
+                var adset=campaign.adsets[si];var adsetId=adset.id||adset.adset_id;
+                if(!adsetId||!disabled[adsetId])continue;
+                var leads=parseInt(adset.leads)||0;var spend=parseFloat(adset.spend)||0;
+                if(leads<1||spend<=0)continue;
+                var cpl=spend/leads;
+                var targetCpl=getTargetCpl(cabinetId);
+                if(cpl<targetCpl){
+                    console.log("[CRM FIX] Re-enable "+adsetId+": "+leads+" leads, CPL $"+cpl.toFixed(2)+" < target $"+targetCpl.toFixed(2));
+                    try{
+                        var normalizedAcct=(cabinetId||'').replace(/^act_/,'');
+                        await _originalFetch.call(window,"/api/adsets/status",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({adset_id:adsetId,adaccount_id:normalizedAcct,fbtool_account_id:fbtoolId,status:"ACTIVE"})});
+                        delete disabled[adsetId];reEnabled++;
+                        console.log("[CRM FIX] ✅ Re-enabled "+adsetId);
+                    }catch(e){console.error("[CRM FIX] ❌ Re-enable failed "+adsetId+":",e.message);}
+                }
+            }
+        }
+        if(reEnabled>0)console.log("[CRM FIX] Re-enabled "+reEnabled+" adsets (burst leads)");
     }
     window.refreshCrmCacheSilently=async function(){
         try{await fetchCrmData();applyCrmLeads();
@@ -191,7 +227,7 @@
     console.log("[CRM FIX v3.5] Loaded: fetch interceptor + render-hook + autorules-inject + sequential batch (30/min, 5-10s delay) + auto-enable rules + no-spend dedup fix");
 })();
 
-// Auto-load: cabinet_enable_consent + scheduled_enable + scheduled_enable_ui
+// Auto-load modules
 (function(){
     function loadScript(src, onload){
         var s=document.createElement('script');
@@ -201,12 +237,27 @@
         document.head.appendChild(s);
     }
     var base='/static/js/';
-    loadScript(base+'cabinet_enable_consent.js', function(){
-        console.log('[CRM FIX] ✅ cabinet_enable_consent.js loaded');
-        loadScript(base+'scheduled_enable.js', function(){
-            console.log('[CRM FIX] ✅ scheduled_enable.js loaded');
-            loadScript(base+'scheduled_enable_ui.js', function(){
-                console.log('[CRM FIX] ✅ scheduled_enable_ui.js loaded');
+    loadScript(base+'settings_state_restore.js', function(){
+        console.log('[CRM FIX] ✅ settings_state_restore.js loaded');
+        loadScript(base+'cabinet_enable_consent.js', function(){
+            console.log('[CRM FIX] ✅ cabinet_enable_consent.js loaded');
+            loadScript(base+'scheduled_enable.js', function(){
+                console.log('[CRM FIX] ✅ scheduled_enable.js loaded');
+                loadScript(base+'scheduled_enable_ui.js', function(){
+                    console.log('[CRM FIX] ✅ scheduled_enable_ui.js loaded');
+                    loadScript(base+'snapshot_collector.js', function(){
+                        console.log('[CRM FIX] ✅ snapshot_collector.js loaded');
+                        loadScript(base+'stop_all.js', function(){
+                            console.log('[CRM FIX] ✅ stop_all.js loaded');
+                            loadScript(base+'dynamic_frequency.js', function(){
+                                console.log('[CRM FIX] ✅ dynamic_frequency.js loaded');
+                                loadScript(base+'creo_tracker.js', function(){
+                                    console.log('[CRM FIX] ✅ creo_tracker.js loaded');
+                                });
+                            });
+                        });
+                    });
+                });
             });
         });
     });

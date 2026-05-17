@@ -42,7 +42,7 @@
             constructor() {
                 this.queue = [];              // Черга звичайних запитів
                 this.priorityQueue = [];      // Пріоритетна черга (адсети)
-                this.maxPerMinute = 19;       // Ліміт (залишаємо 1 резерв)
+                this.maxPerMinute = 29;       // Ліміт 30 (залишаємо 1 резерв)
                 this.minuteStartTime = null;  // Початок поточної хвилини
                 this.requestsThisMinute = 0;  // Лічильник запитів
             }
