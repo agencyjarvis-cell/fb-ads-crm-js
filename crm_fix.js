@@ -236,29 +236,34 @@
         s.onerror=function(){console.warn('[CRM FIX] Failed to load: '+src);};
         document.head.appendChild(s);
     }
+    function loadAll(list, done){
+        var i=0;
+        function next(){
+            if(i>=list.length){if(done)done();return;}
+            var src=list[i++];
+            loadScript(src, function(){console.log('[CRM FIX] ✅ '+src+' loaded'); next();});
+        }
+        next();
+    }
     var base='/static/js/';
-    loadScript(base+'settings_state_restore.js', function(){
-        console.log('[CRM FIX] ✅ settings_state_restore.js loaded');
-        loadScript(base+'cabinet_enable_consent.js', function(){
-            console.log('[CRM FIX] ✅ cabinet_enable_consent.js loaded');
-            loadScript(base+'scheduled_enable.js', function(){
-                console.log('[CRM FIX] ✅ scheduled_enable.js loaded');
-                loadScript(base+'scheduled_enable_ui.js', function(){
-                    console.log('[CRM FIX] ✅ scheduled_enable_ui.js loaded');
-                    loadScript(base+'snapshot_collector.js', function(){
-                        console.log('[CRM FIX] ✅ snapshot_collector.js loaded');
-                        loadScript(base+'stop_all.js', function(){
-                            console.log('[CRM FIX] ✅ stop_all.js loaded');
-                            loadScript(base+'dynamic_frequency.js', function(){
-                                console.log('[CRM FIX] ✅ dynamic_frequency.js loaded');
-                                loadScript(base+'creo_tracker.js', function(){
-                                    console.log('[CRM FIX] ✅ creo_tracker.js loaded');
-                                });
-                            });
-                        });
-                    });
-                });
-            });
-        });
-    });
+    var modBase='/static/js/modules/';
+    // Order: existing legacy first (some depend on each other), then new modules, then v2 patches last.
+    var queue = [
+        base+'settings_state_restore.js',
+        base+'cabinet_enable_consent.js',
+        base+'scheduled_enable.js',
+        base+'scheduled_enable_ui.js',
+        base+'snapshot_collector.js',
+        base+'stop_all.js',
+        base+'dynamic_frequency.js',
+        base+'creo_tracker.js',
+        // v2 modules
+        modBase+'retry_queue.js',
+        modBase+'token_monitor.js',
+        modBase+'reject_tracker.js',
+        modBase+'geo_toggle.js',
+        // monkey-patches that depend on the above
+        base+'crm_v2_patches.js'
+    ];
+    loadAll(queue);
 })();
