@@ -10,11 +10,28 @@
     'use strict';
 
     // ========== HELPERS ==========
+    // Geo mapping: campaign name prefix (before first dot) → geo code
+    // GP = TJ (Tajikistan), USM = UZ (Uzbekistan), KGNG = KG (Kyrgyzstan)
+    var GEO_PREFIX_MAP = {
+        'GP': 'GP',
+        'USM': 'USM',
+        'KGNG': 'KGNG'
+    };
+
     function getGeoFromRow(row) {
         if (row.geo) return row.geo;
         var name = row.campaign_name || row.campaign || '';
+        // Primary: extract prefix before first dot (e.g. "GP.SD.123..." → "GP")
+        var dotMatch = name.match(/^([A-Z]+)\./);
+        if (dotMatch) {
+            var prefix = dotMatch[1];
+            // Return the prefix as geo (GP, USM, KGNG, etc.)
+            return prefix;
+        }
+        // Fallback: XX- prefix (e.g. US-Campaign)
         var match = name.match(/^([A-Z]{2})-/);
-        return match ? match[1] : '';
+        if (match) return match[1];
+        return '';
     }
 
     function isOurCampaign(row) {

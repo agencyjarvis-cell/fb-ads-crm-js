@@ -150,7 +150,12 @@
         rows.forEach(function(r){
             var cid = r.adaccount_id || r.account_id;
             if (!cid) return;
-            var pn = r.profile_name || r.profile || r.adaccount_name || cid;
+            // Group by fbtool_account_id (= real profile), fallback to account_name
+            var pn = r.fbtool_account_id || r.profile_name || r.profile || r.account_name || cid;
+            // Make fbtool_account_id human-readable
+            if (r.fbtool_account_id && pn === r.fbtool_account_id) {
+                pn = 'Profile ' + r.fbtool_account_id;
+            }
             if (!map[cid]) map[cid] = pn;
         });
         return map;
@@ -160,10 +165,14 @@
         var section = document.getElementById('timerSection');
         if (!section || section.style.display === 'none') return;
         if (section.getAttribute('data-profile-grouped') === '1') return;
+        if (window._timerGrpBusy) return; // guard against re-entrant calls
+        window._timerGrpBusy = true;
+        // Set flag BEFORE DOM changes to prevent MutationObserver infinite loop
+        section.setAttribute('data-profile-grouped', '1');
 
         // Find all .timer-cab elements
         var cabs = section.querySelectorAll('.timer-cab');
-        if (!cabs.length) return;
+        if (!cabs.length) { window._timerGrpBusy = false; return; }
 
         var profileMap = getProfileByCabId();
         // Group by profile name
@@ -179,7 +188,7 @@
         });
         if (order.length <= 1) {
             // Single-profile fallback — skip grouping
-            section.setAttribute('data-profile-grouped', '1');
+            window._timerGrpBusy = false;
             return;
         }
 
@@ -200,48 +209,88 @@
             groups[pn].forEach(function(c){ parent.insertBefore(c, header.nextSibling.nextSibling || null); });
         });
 
-        // Bind profile-select-all
+        // Bind profile-select-all (re-render-safe: uses cab IDs, not DOM walk)
         section.querySelectorAll('[data-profile-selall]').forEach(function(cb){
             cb.addEventListener('change', function(e){
                 e.stopPropagation();
                 var pn = this.getAttribute('data-profile-selall');
                 var on = this.checked;
-                // Find next siblings until next profile header — toggle adset checkboxes in those
-                var node = this.closest('.timer-profile-hdr').nextSibling;
-                while (node) {
-                    if (node.classList && node.classList.contains('timer-profile-hdr')) break;
-                    if (node.querySelectorAll) {
-                        // Expand cabinet first (so adsets exist)
-                        var hdr = node.querySelector ? node.querySelector('.timer-cab-hdr') : null;
-                        if (hdr && on) {
-                            // Click to expand if collapsed
-                            var label = hdr.querySelector('span');
-                            if (label && /^▶/.test(label.textContent)) hdr.click();
+                // Collect cab IDs for this profile from data (not DOM — DOM may re-render)
+                var profileMap = getProfileByCabId();
+                var cabIds = [];
+                Object.keys(profileMap).forEach(function(cid){
+                    if (String(profileMap[cid]) === String(pn)) cabIds.push(cid);
+                });
+                // Block re-grouping during mass selection
+                window._timerGrpBusy = true;
+                var processed = 0;
+                function processCab(idx) {
+                    if (idx >= cabIds.length) {
+                        window._timerGrpBusy = false;
+                        // Re-apply profile grouping after all done
+                        var sec = document.getElementById('timerSection');
+                        if (sec) {
+                            sec.removeAttribute('data-profile-grouped');
+                            setTimeout(groupTimerCabsByProfile, 100);
                         }
-                        node.querySelectorAll('input[data-adset]').forEach(function(acb){
+                        console.log('[PROFILE-SELALL] Selected ' + processed + ' ACTIVE adsets in ' + cabIds.length + ' cabs for ' + pn);
+                        return;
+                    }
+                    var cid = cabIds[idx];
+                    var hdr = section.querySelector('.timer-cab-hdr[data-cab-id="' + cid + '"]');
+                    if (!hdr) { processCab(idx + 1); return; }
+                    var cab = hdr.closest('.timer-cab');
+                    if (!cab) { processCab(idx + 1); return; }
+                    // Expand if collapsed
+                    if (on) {
+                        var label = hdr.querySelector('span');
+                        if (label && /^▶/.test(label.textContent)) hdr.click();
+                    }
+                    // Re-query cab after expand (DOM may have re-rendered)
+                    setTimeout(function(){
+                        // Re-find cab element by data-cab-id (old ref may be stale)
+                        var freshHdr = document.querySelector('.timer-cab-hdr[data-cab-id="' + cid + '"]');
+                        var freshCab = freshHdr ? freshHdr.closest('.timer-cab') : null;
+                        if (!freshCab) { processCab(idx + 1); return; }
+                        var checkboxes = freshCab.querySelectorAll('input[data-adset]');
+                        checkboxes.forEach(function(acb){
+                            if (on) {
+                                var statusEl = acb.parentElement ? acb.parentElement.querySelector('.timer-status-active') : null;
+                                if (!statusEl) return;
+                            }
                             if (acb.checked !== on) {
                                 acb.checked = on;
                                 acb.dispatchEvent(new Event('change', {bubbles:true}));
+                                processed++;
                             }
                         });
-                    }
-                    node = node.nextSibling;
+                        processCab(idx + 1);
+                    }, 400);
                 }
+                processCab(0);
             });
         });
 
-        section.setAttribute('data-profile-grouped', '1');
+        window._timerGrpBusy = false;
     }
 
     function observeTimerSection() {
         var section = document.getElementById('timerSection');
         if (!section) return false;
         if (window._timerGrpObserved) return true;
+        var _grpTimer = null;
         var mo = new MutationObserver(function(){
-            // Re-render resets data-profile-grouped — reapply
-            if (section.style.display !== 'none' &&
-                section.getAttribute('data-profile-grouped') !== '1') {
-                groupTimerCabsByProfile();
+            // Re-render may destroy profile headers while flag remains.
+            // Check BOTH the flag AND actual header presence.
+            if (section.style.display !== 'none' && !window._timerGrpBusy) {
+                var flagSet = section.getAttribute('data-profile-grouped') === '1';
+                var headersExist = section.querySelectorAll('.timer-profile-hdr').length > 0;
+                if (!flagSet || (flagSet && !headersExist)) {
+                    // Headers were destroyed by re-render — clear flag and regroup
+                    section.removeAttribute('data-profile-grouped');
+                    clearTimeout(_grpTimer);
+                    _grpTimer = setTimeout(groupTimerCabsByProfile, 200);
+                }
             }
         });
         mo.observe(section, {childList:true, subtree:true});
@@ -555,6 +604,67 @@
     }
 
     // ========================================================================
+    // 8) SELECT-ALL ACTIVE ONLY — intercept all "select all" buttons/links
+    //    to only select ACTIVE adsets (user requested this TWICE)
+    // ========================================================================
+    function patchSelectAllActiveOnly() {
+        // Use event delegation to intercept all select-all clicks in timer section
+        document.addEventListener('click', function(e) {
+            var t = e.target;
+            if (!t) return;
+
+            // Match "select all" links per-campaign (app.js renders these as <a> or <span>)
+            var isSelectAll = false;
+            if (t.textContent && /select\s*all/i.test(t.textContent.trim())) isSelectAll = true;
+            if (t.textContent && /Select\s*All/i.test(t.textContent.trim())) isSelectAll = true;
+
+            // Match "Виділити все" buttons (per-cabinet in timer section)
+            var isVybVse = false;
+            if (t.textContent && /Виділити\s*все/i.test(t.textContent.trim())) isVybVse = true;
+            if (t.closest && t.closest('[class*="timer"]') && isVybVse) isVybVse = true;
+
+            if (!isSelectAll && !isVybVse) return;
+
+            // Check if we're inside the timer section
+            var timerSection = document.getElementById('timerSection');
+            if (!timerSection || !timerSection.contains(t)) return;
+
+            // Prevent default behavior
+            e.preventDefault();
+            e.stopPropagation();
+
+            // Find the scope: for per-campaign "select all" → parent campaign div;
+            // for per-cabinet "Виділити все" → cabinet div; for top "Select All" → whole section
+            var scope;
+            var cabinet = t.closest('.timer-cab');
+            if (cabinet) {
+                scope = cabinet;
+            } else {
+                // Top-level Select All — apply to all cabs in the group
+                var group = t.closest('.timer-group') || timerSection;
+                scope = group;
+            }
+
+            // Select only ACTIVE adsets within scope
+            var checkboxes = scope.querySelectorAll('input[data-adset]');
+            var selected = 0;
+            checkboxes.forEach(function(cb) {
+                var statusEl = cb.parentElement ? cb.parentElement.querySelector('.timer-status-active') : null;
+                if (statusEl) {
+                    if (!cb.checked) {
+                        cb.checked = true;
+                        cb.dispatchEvent(new Event('change', {bubbles: true}));
+                        selected++;
+                    }
+                }
+            });
+            console.log('[SELECT-ALL-ACTIVE] ✅ Selected ' + selected + ' ACTIVE adsets out of ' + checkboxes.length + ' total');
+        }, true); // use capture phase to intercept before app.js handlers
+
+        console.log('[SELECT-ALL-ACTIVE] ✅ Interceptor wired');
+    }
+
+    // ========================================================================
     // INIT
     // ========================================================================
     function init() {
@@ -581,6 +691,7 @@
         }, 500);
 
         patchTimerRerender();
+        patchSelectAllActiveOnly();
 
         console.log('[CRM v2 PATCHES] ✅ All patches scheduled');
     }
