@@ -233,7 +233,7 @@
         var s=document.createElement('script');
         s.src=src;
         s.onload=onload||function(){};
-        s.onerror=function(){console.warn('[CRM FIX] Failed to load: '+src);};
+        s.onerror=function(){console.warn('[CRM FIX] ⚠️ Failed to load: '+src+' — skipping'); if(onload)onload();};
         document.head.appendChild(s);
     }
     function loadAll(list, done){
@@ -246,8 +246,8 @@
         next();
     }
     var base='/static/js/';
-    var modBase='/static/js/modules/';
     // Order: existing legacy first (some depend on each other), then new modules, then v2 patches last.
+    // NOTE: all modules moved to root /static/js/ — PyInstaller Flask doesn't serve subdirectories
     var queue = [
         base+'settings_state_restore.js',
         base+'cabinet_enable_consent.js',
@@ -257,13 +257,8 @@
         base+'stop_all.js',
         base+'dynamic_frequency.js',
         base+'creo_tracker.js',
-        // v2 modules
-        modBase+'retry_queue.js',
-        modBase+'token_monitor.js',
-        modBase+'reject_tracker.js',
-        modBase+'geo_toggle.js',
-        // monkey-patches that depend on the above
-        base+'crm_v2_patches.js'
-    ];
-    loadAll(queue);
-})();
+        // v2 modules (moved from modules/ to root)
+        base+'retry_queue.js',
+        base+'token_monitor.js',
+        base+'reject_tracker.js',
+        base+'geo_toggle.js',
