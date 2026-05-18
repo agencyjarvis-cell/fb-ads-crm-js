@@ -1,6 +1,7 @@
 (function(){
     const _originalFetch=window.fetch;
     let crmLookup={};let crmTotal=0;
+    let crmCacheAge=-1;let crmSource='unknown';let crmFetchErrors=0;
     window.fetch=function(url,options){
         if(typeof url==="string"&&url.includes("/api/refresh-crm")&&!url.includes("5099")){
             return _originalFetch.call(this,"http://localhost:5099/api/refresh-crm",options||{method:"POST"});
@@ -21,17 +22,61 @@
         }
         return _originalFetch.call(this,url,options);
     };
+    function updateCrmStatusIndicator(status, age){
+        var el=document.getElementById('crm-status-indicator');
+        if(!el){
+            el=document.createElement('div');
+            el.id='crm-status-indicator';
+            el.style.cssText='position:fixed;top:8px;right:8px;z-index:99999;padding:4px 10px;border-radius:6px;font-size:12px;font-family:monospace;cursor:pointer;opacity:0.9;';
+            el.title='CRM refresh status';
+            document.body.appendChild(el);
+        }
+        if(status==='ok'){
+            var ageMin=Math.round(age/60);
+            el.style.background='#1a7f37';el.style.color='#fff';
+            el.textContent='CRM: '+Object.keys(crmLookup).length+' | '+crmTotal+' leads | '+ageMin+'m';
+        }else if(status==='stale'){
+            var ageMin=Math.round(age/60);
+            el.style.background='#d1242f';el.style.color='#fff';
+            el.textContent='⚠ CRM STALE: '+ageMin+'m old! Scraper down?';
+        }else if(status==='error'){
+            el.style.background='#d1242f';el.style.color='#fff';
+            el.textContent='❌ CRM: port 5099 not responding ('+crmFetchErrors+'x)';
+        }
+    }
     async function fetchCrmData(){
-        try{var r=await _originalFetch.call(window,"http://localhost:5099/api/refresh-crm");
+        try{
+            // POST forces a fresh scrape attempt; GET only reads stale cache
+            var r=await _originalFetch.call(window,"http://localhost:5099/api/refresh-crm",{method:"POST",headers:{"Content-Type":"application/json"}});
             var data=await r.json();
             if(data.success&&data.data){
+                crmCacheAge=data.cache_age_sec||0;
+                crmSource=data.source||'unknown';
+                crmFetchErrors=0;
+                var prevTotal=crmTotal;var prevCount=Object.keys(crmLookup).length;
                 crmLookup={};crmTotal=0;
                 for(var i=0;i<data.data.length;i++){var entry=data.data[i];
                     if(entry.campaign_name&&entry.leads>0){crmLookup[entry.campaign_name]=entry.leads;crmTotal+=entry.leads;}}
                 window.lastCrmTimestamp=Date.now();window.lastCrmUpdate=Date.now();window._crmFixLookup=crmLookup;
-                console.log("[CRM FIX v3] CRM cache: "+Object.keys(crmLookup).length+" entries, "+crmTotal+" leads");
+                var count=Object.keys(crmLookup).length;
+                var changed=(count!==prevCount||crmTotal!==prevTotal);
+                var freshTag=crmCacheAge<120?'FRESH':crmCacheAge<300?'AGING':'STALE';
+                console.log("[CRM FIX v3] CRM cache: "+count+" entries, "+crmTotal+" leads | age:"+Math.round(crmCacheAge)+"s ("+freshTag+") | src:"+crmSource+(changed?' [UPDATED]':''));
+                if(crmCacheAge>300){
+                    console.error("[CRM FIX v3] ⚠ CRM STALE ("+Math.round(crmCacheAge/60)+"min). Scraper may be down! Check Brave CDP / port 9223.");
+                    updateCrmStatusIndicator('stale',crmCacheAge);
+                }else{
+                    updateCrmStatusIndicator('ok',crmCacheAge);
+                }
             }
-        }catch(e){console.warn("[CRM FIX v3] CRM fetch failed:",e.message);}
+        }catch(e){
+            crmFetchErrors++;
+            console.warn("[CRM FIX v3] CRM fetch failed ("+crmFetchErrors+"x):",e.message);
+            updateCrmStatusIndicator('error',-1);
+            if(crmFetchErrors===3){
+                console.error("[CRM FIX v3] ❌ Port 5099 unreachable 3 times! CRM server likely crashed. Restart start_all_jeez.command");
+            }
+        }
     }
     function applyCrmLeads(){
         if(!window.lastResults||!Array.isArray(window.lastResults))return 0;
@@ -60,7 +105,7 @@
     window.checkCrmCacheFreshness=function(){
         if(window.lastCrmTimestamp&&Object.keys(crmLookup).length>0){
             var ageMin=(Date.now()-window.lastCrmTimestamp)/60000;
-            return Promise.resolve({fresh:true,age_minutes:ageMin,ttl_minutes:2,source:"crm_fix_v3"});}
+            return Promise.resolve({fresh:crmCacheAge<300,age_minutes:ageMin,server_cache_age_sec:crmCacheAge,source:crmSource,ttl_minutes:2,source:"crm_fix_v3"});}
         return Promise.resolve({fresh:false,error:"CRM not loaded yet",ttl_minutes:2});
     };
     function stripLeadsFromZeroSpend(){
@@ -224,7 +269,7 @@
     setTimeout(function(){clearInterval(arTimer);},20000);
     fetchCrmData();
     setInterval(fetchCrmData,30000);
-    console.log("[CRM FIX v3.5] Loaded: fetch interceptor + render-hook + autorules-inject + sequential batch (30/min, 5-10s delay) + auto-enable rules + no-spend dedup fix");
+    console.log("[CRM FIX v3.6] Loaded: POST-force scrape + staleness monitor + status indicator + render-hook + autorules-inject + sequential batch (30/min, 5-10s delay) + auto-enable rules + no-spend dedup fix");
 })();
 
 // Auto-load modules
