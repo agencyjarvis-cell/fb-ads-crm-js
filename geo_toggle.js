@@ -99,102 +99,95 @@
     }
 
     // ========== MASS ACTIONS ==========
+    // Global lock: prevents overlapping geo operations and blocks AFK auto-refresh
+    var _geoRunning = false;
+    window._geoRunning = false; // Expose for AFK/auto-refresh to check
+
+    function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+
+    // Batch size: send N requests, then pause. Prevents server overload.
+    var BATCH_SIZE = 5;       // requests per batch
+    var BATCH_DELAY = 3000;   // ms pause between batches
+    var REQUEST_DELAY = 500;  // ms between individual requests in a batch
+
     async function disableAdsetsByGeo(geo) {
-        var data = window.lastResults || [];
-        var targets = [];
-
-        data.forEach(function(row) {
-            if (getGeoFromRow(row) !== geo) return;
-            if (!isOurCampaign(row)) return; // only our campaigns
-            var active = getActiveAdsets([row]);
-            targets = targets.concat(active);
-        });
-
-        if (!targets.length) {
-            console.log('[GEO] No active adsets for geo ' + geo);
-            if (typeof showNotification === 'function') showNotification('No active adsets for ' + geo);
-            return 0;
-        }
-
-        console.log('[GEO] Disabling ' + targets.length + ' adsets for geo ' + geo);
-        var disabled = 0;
-
-        for (var i = 0; i < targets.length; i++) {
-            var t = targets[i];
-            try {
-                var normalizedAcct = (t.row.adaccount_id || t.row.account_id || '').replace(/^act_/, '');
-                var resp = await fetch('/api/adsets/status', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        adset_id: t.id,
-                        adaccount_id: normalizedAcct,
-                        fbtool_account_id: t.row.fbtool_account_id,
-                        status: 'PAUSED'
-                    })
-                });
-                var data = await resp.json();
-                if (data.success) {
-                    disabled++;
-                    console.log('[GEO] Disabled ' + t.name);
-                }
-            } catch (e) {
-                console.error('[GEO] Error disabling ' + t.id + ': ' + e.message);
+        if (_geoRunning) { console.warn('[GEO] Already running, skipping disable for ' + geo); return 0; }
+        _geoRunning = true; window._geoRunning = true;
+        try {
+            var data = window.lastResults || [];
+            var targets = [];
+            data.forEach(function(row) {
+                if (getGeoFromRow(row) !== geo) return;
+                if (!isOurCampaign(row)) return;
+                var active = getActiveAdsets([row]);
+                targets = targets.concat(active);
+            });
+            if (!targets.length) {
+                console.log('[GEO] No active adsets for geo ' + geo);
+                if (typeof showNotification === 'function') showNotification('No active adsets for ' + geo);
+                return 0;
             }
-        }
-
-        console.log('[GEO] Disabled ' + disabled + '/' + targets.length + ' adsets for ' + geo);
-        if (typeof showNotification === 'function') showNotification('Disabled ' + disabled + ' adsets for ' + geo);
-        return disabled;
+            console.log('[GEO] Disabling ' + targets.length + ' adsets for geo ' + geo + ' (batches of ' + BATCH_SIZE + ')');
+            var disabled = 0;
+            for (var i = 0; i < targets.length; i++) {
+                var t = targets[i];
+                try {
+                    var normalizedAcct = (t.row.adaccount_id || t.row.account_id || '').replace(/^act_/, '');
+                    var resp = await fetch('/api/adsets/status', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ adset_id: t.id, adaccount_id: normalizedAcct, fbtool_account_id: t.row.fbtool_account_id, status: 'PAUSED' })
+                    });
+                    var rdata = await resp.json();
+                    if (rdata.success) { disabled++; console.log('[GEO] Disabled ' + t.name); }
+                } catch (e) { console.error('[GEO] Error disabling ' + t.id + ': ' + e.message); }
+                if ((i + 1) % BATCH_SIZE === 0 && i < targets.length - 1) { console.log('[GEO] Batch pause after ' + (i+1) + '/' + targets.length); await sleep(BATCH_DELAY); }
+                else if (i < targets.length - 1) { await sleep(REQUEST_DELAY); }
+            }
+            console.log('[GEO] Disabled ' + disabled + '/' + targets.length + ' adsets for ' + geo);
+            if (typeof showNotification === 'function') showNotification('Disabled ' + disabled + ' adsets for ' + geo);
+            return disabled;
+        } finally { _geoRunning = false; window._geoRunning = false; }
     }
 
     async function enableAdsetsByGeo(geo) {
-        var data = window.lastResults || [];
-        var targets = [];
-
-        data.forEach(function(row) {
-            if (getGeoFromRow(row) !== geo) return;
-            if (!isOurCampaign(row)) return;
-            var paused = getPausedAdsets([row]);
-            targets = targets.concat(paused);
-        });
-
-        if (!targets.length) {
-            console.log('[GEO] No paused adsets for geo ' + geo);
-            if (typeof showNotification === 'function') showNotification('No paused adsets for ' + geo);
-            return 0;
-        }
-
-        console.log('[GEO] Enabling ' + targets.length + ' adsets for geo ' + geo);
-        var enabled = 0;
-
-        for (var i = 0; i < targets.length; i++) {
-            var t = targets[i];
-            try {
-                var normalizedAcct = (t.row.adaccount_id || t.row.account_id || '').replace(/^act_/, '');
-                var resp = await fetch('/api/adsets/status', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        adset_id: t.id,
-                        adaccount_id: normalizedAcct,
-                        fbtool_account_id: t.row.fbtool_account_id,
-                        status: 'ACTIVE'
-                    })
-                });
-                var data = await resp.json();
-                if (data.success) {
-                    enabled++;
-                    console.log('[GEO] Enabled ' + t.name);
-                }
-            } catch (e) {
-                console.error('[GEO] Error enabling ' + t.id + ': ' + e.message);
+        if (_geoRunning) { console.warn('[GEO] Already running, skipping enable for ' + geo); return 0; }
+        _geoRunning = true; window._geoRunning = true;
+        try {
+            var data = window.lastResults || [];
+            var targets = [];
+            data.forEach(function(row) {
+                if (getGeoFromRow(row) !== geo) return;
+                if (!isOurCampaign(row)) return;
+                var paused = getPausedAdsets([row]);
+                targets = targets.concat(paused);
+            });
+            if (!targets.length) {
+                console.log('[GEO] No paused adsets for geo ' + geo);
+                if (typeof showNotification === 'function') showNotification('No paused adsets for ' + geo);
+                return 0;
             }
-        }
-
-        console.log('[GEO] Enabled ' + enabled + '/' + targets.length + ' adsets for ' + geo);
-        if (typeof showNotification === 'function') showNotification('Enabled ' + enabled + ' adsets for ' + geo);
-        return enabled;
+            console.log('[GEO] Enabling ' + targets.length + ' adsets for geo ' + geo + ' (batches of ' + BATCH_SIZE + ')');
+            var enabled = 0;
+            for (var i = 0; i < targets.length; i++) {
+                var t = targets[i];
+                try {
+                    var normalizedAcct = (t.row.adaccount_id || t.row.account_id || '').replace(/^act_/, '');
+                    var resp = await fetch('/api/adsets/status', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ adset_id: t.id, adaccount_id: normalizedAcct, fbtool_account_id: t.row.fbtool_account_id, status: 'ACTIVE' })
+                    });
+                    var rdata = await resp.json();
+                    if (rdata.success) { enabled++; console.log('[GEO] Enabled ' + t.name); }
+                } catch (e) { console.error('[GEO] Error enabling ' + t.id + ': ' + e.message); }
+                if ((i + 1) % BATCH_SIZE === 0 && i < targets.length - 1) { console.log('[GEO] Batch pause after ' + (i+1) + '/' + targets.length); await sleep(BATCH_DELAY); }
+                else if (i < targets.length - 1) { await sleep(REQUEST_DELAY); }
+            }
+            console.log('[GEO] Enabled ' + enabled + '/' + targets.length + ' adsets for ' + geo);
+            if (typeof showNotification === 'function') showNotification('Enabled ' + enabled + ' adsets for ' + geo);
+            return enabled;
+        } finally { _geoRunning = false; window._geoRunning = false; }
     }
 
     // ========== LAUNCH TAB UI ==========

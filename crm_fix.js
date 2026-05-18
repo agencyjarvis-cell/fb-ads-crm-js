@@ -263,6 +263,7 @@
         base+'reject_tracker.js',
         base+'geo_toggle.js',
         // monkey-patches that depend on the above
+        base+'afk_optimizer.js',
         base+'crm_v2_patches.js'
     ];
     loadAll(queue);

@@ -196,6 +196,9 @@
         var firstCab = cabs[0];
         var parent = firstCab.parentNode;
         order.forEach(function(pn){
+            try {
+            // Guard: skip if nodes were removed by a concurrent re-render
+            if (!groups[pn] || !groups[pn].length || !groups[pn][0].parentNode) return;
             var header = document.createElement('div');
             header.className = 'timer-profile-hdr';
             header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:10px 14px;margin:14px 0 6px 0;border-radius:8px;background:linear-gradient(90deg,#1e3a5f 0%,#2c5282 100%);color:#fff;font-weight:700;font-size:14px;';
@@ -207,6 +210,7 @@
             parent.insertBefore(header, groups[pn][0]);
             // Move all cabs of this profile to come right after header in order
             groups[pn].forEach(function(c){ parent.insertBefore(c, header.nextSibling.nextSibling || null); });
+            } catch(e) { console.warn('[CRM_PATCHES] insertBefore skipped for profile ' + pn + ': ' + e.message); }
         });
 
         // Bind profile-select-all (re-render-safe: uses cab IDs, not DOM walk)
