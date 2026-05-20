@@ -8,8 +8,20 @@
         }
         if(typeof url==="string"&&url.includes("/api/collect")&&options&&options.body){
             try{var body=JSON.parse(options.body);
-                if(body.refresh_crm===true){body.refresh_crm=false;options=Object.assign({},options,{body:JSON.stringify(body)});}
+                // refresh_crm override removed - let Flask do fresh scrape
             }catch(e){}
+        }
+        if(typeof url==="string"&&url.includes("/api/auto-rules/settings")){
+            return _originalFetch.call(this,url,options).then(function(resp){
+                return resp.clone().json().then(function(data){
+                    if(!data.success&&(data.settings||data.default_rules||data.cabinet_enabled)){
+                        var wrapped={success:true,settings:data.settings||data};
+                        console.log("[CRM FIX v3] Wrapped auto-rules/settings response (added success:true)");
+                        return new Response(JSON.stringify(wrapped),{status:200,headers:{"Content-Type":"application/json"}});
+                    }
+                    return resp;
+                }).catch(function(){return resp;});
+            });
         }
         if(typeof url==="string"&&url.includes("/api/rate-limit-stats")){
             return _originalFetch.call(this,url,options).then(function(resp){
@@ -44,10 +56,14 @@
             el.textContent='❌ CRM: port 5099 not responding ('+crmFetchErrors+'x)';
         }
     }
-    async function fetchCrmData(){
+    async function fetchCrmData(forcePost){
         try{
-            // POST forces a fresh scrape attempt; GET only reads stale cache
-            var r=await _originalFetch.call(window,"http://localhost:5099/api/refresh-crm",{method:"POST",headers:{"Content-Type":"application/json"}});
+            var method="GET";
+            if(forcePost||crmCacheAge>300||crmCacheAge<0)method="POST";
+            var opts={method:method};
+            if(method==="POST")opts.headers={"Content-Type":"application/json"};
+            var r=await _originalFetch.call(window,"http://localhost:5099/api/refresh-crm",opts);
+            if(r.status===429){crmCacheAge=30;crmFetchErrors=0;updateCrmStatusIndicator("ok",crmCacheAge);console.log("[CRM FIX v3] Scrape in progress, will GET cache next cycle");return;}
             var data=await r.json();
             if(data.success&&data.data){
                 crmCacheAge=data.cache_age_sec||0;
@@ -81,6 +97,28 @@
     function applyCrmLeads(){
         if(!window.lastResults||!Array.isArray(window.lastResults))return 0;
         if(Object.keys(crmLookup).length===0)return 0;
+        // Pass 1: collect total spend per ad name across ALL adsets (dedup)
+        var spendByName={};
+        for(var ci=0;ci<window.lastResults.length;ci++){
+            var campaign=window.lastResults[ci];
+            if(!campaign.adsets||!Array.isArray(campaign.adsets))continue;
+            for(var si=0;si<campaign.adsets.length;si++){
+                var adset=campaign.adsets[si];
+                if(!adset.ads||!Array.isArray(adset.ads))continue;
+                for(var ai=0;ai<adset.ads.length;ai++){
+                    var ad=adset.ads[ai];
+                    if(ad.name&&crmLookup[ad.name]!==undefined){
+                        var adSpend=parseFloat(ad.spend)||0;
+                        if(!spendByName[ad.name])spendByName[ad.name]={total:0,count:0};
+                        spendByName[ad.name].total+=adSpend;
+                        spendByName[ad.name].count++;
+                    }
+                }
+            }
+        }
+        // Pass 2: distribute CRM leads proportionally by spend (no double-counting)
+        // Track remainder per ad name to avoid rounding loss
+        var distributed={};
         var totalMatched=0;var matched=[];
         for(var ci=0;ci<window.lastResults.length;ci++){
             var campaign=window.lastResults[ci];
@@ -92,14 +130,37 @@
                 var adsetLeads=0;var adsetHasMatch=false;
                 for(var ai=0;ai<adset.ads.length;ai++){
                     var ad=adset.ads[ai];
-                    if(ad.name&&crmLookup[ad.name]!==undefined){ad.leads=crmLookup[ad.name];adsetLeads+=ad.leads;adsetHasMatch=true;
-                        if(matched.indexOf(ad.name)===-1)matched.push(ad.name);}}
+                    if(ad.name&&crmLookup[ad.name]!==undefined){
+                        var crmLeads=crmLookup[ad.name];
+                        var info=spendByName[ad.name];
+                        if(info&&info.count>1){
+                            if(!distributed[ad.name])distributed[ad.name]={given:0,idx:0};
+                            var d=distributed[ad.name];
+                            d.idx++;
+                            if(d.idx>=info.count){
+                                // Last occurrence gets remainder (prevents rounding loss)
+                                ad.leads=crmLeads-d.given;
+                            }else{
+                                var adSpend=parseFloat(ad.spend)||0;
+                                if(info.total>0){ad.leads=Math.round(crmLeads*(adSpend/info.total));}
+                                else{ad.leads=Math.floor(crmLeads/info.count);}
+                                d.given+=ad.leads;
+                            }
+                        }else{
+                            ad.leads=crmLeads;
+                        }
+                        adsetLeads+=ad.leads;adsetHasMatch=true;
+                        if(matched.indexOf(ad.name)===-1)matched.push(ad.name);
+                    }
+                }
                 if(adsetHasMatch){adset.leads=adsetLeads;adset.cpl=adsetLeads>0?(parseFloat(adset.spend)||0)/adsetLeads:null;campaignHasMatch=true;}
-                campaignLeads+=(adsetHasMatch?adsetLeads:(parseFloat(adset.leads)||0));
+                else{adset.leads=0;adset.cpl=null;}
+                campaignLeads+=(adsetHasMatch?adsetLeads:0);
             }
             if(campaignHasMatch){campaign.leads=campaignLeads;campaign.cpl=campaignLeads>0?(parseFloat(campaign.spend)||0)/campaignLeads:null;totalMatched+=campaignLeads;}
+            else{campaign.leads=0;campaign.cpl=null;}
         }
-        if(totalMatched>0)console.log("[CRM FIX v3] Applied "+totalMatched+" leads: ["+matched.join(", ")+"]");
+        if(totalMatched>0)console.log("[CRM FIX v3] Applied "+totalMatched+" leads (dedup): ["+matched.join(", ")+"]");
         return totalMatched;
     }
     window.checkCrmCacheFreshness=function(){
@@ -174,7 +235,7 @@
         if(typeof acquireLock==="function"&&!acquireLock("Оновлення CRM даних"))return;
         if(!confirm("Оновити CRM дані?")){if(typeof releaseLock==="function")releaseLock();return;}
         if(typeof showLoading==="function")showLoading("Оновлення CRM...");
-        try{await fetchCrmData();applyCrmLeads();
+        try{await fetchCrmData(true);applyCrmLeads();
             if(typeof window.renderActiveCampaignsTree==="function"&&window.lastResults)window.renderActiveCampaignsTree(window.lastResults);
             if(typeof hideLoading==="function")hideLoading();
             if(typeof releaseLock==="function")releaseLock("CRM оновлено");
@@ -269,7 +330,22 @@
     setTimeout(function(){clearInterval(arTimer);},20000);
     fetchCrmData();
     setInterval(fetchCrmData,30000);
-    console.log("[CRM FIX v3.6] Loaded: POST-force scrape + staleness monitor + status indicator + render-hook + autorules-inject + sequential batch (30/min, 5-10s delay) + auto-enable rules + no-spend dedup fix");
+    // Patch recomputeStatsFromRows to only count leads from active campaigns (fixes 205 vs 174 discrepancy)
+    var _origRecompute=window.recomputeStatsFromRows;
+    if(typeof _origRecompute==="function"){
+        window.recomputeStatsFromRows=function(rows){
+            var all=Array.isArray(rows)?rows:[];
+            var active=all.filter(function(row){
+                if(row.status==='crm_only')return false;
+                return typeof window.isActiveCampaign==='function'?window.isActiveCampaign(row):true;
+            });
+            var result=_origRecompute.call(this,active);
+            result.crm_only_count=all.filter(function(r){return r.status==='crm_only';}).length;
+            return result;
+        };
+        console.log("[CRM FIX v3] Patched recomputeStatsFromRows (active-only leads)");
+    }
+    console.log("[CRM FIX v3.8] Loaded: lead count fix + settings wrap + all v3.7 features");
 })();
 
 // Auto-load modules
@@ -278,7 +354,7 @@
         var s=document.createElement('script');
         s.src=src;
         s.onload=onload||function(){};
-        s.onerror=function(){console.warn('[CRM FIX] ⚠️ Failed to load: '+src+' — skipping'); if(onload)onload();};
+        s.onerror=function(){console.warn('[CRM FIX] Failed to load: '+src+' - skipping'); if(onload)onload();};
         document.head.appendChild(s);
     }
     function loadAll(list, done){
@@ -286,30 +362,24 @@
         function next(){
             if(i>=list.length){if(done)done();return;}
             var src=list[i++];
-            loadScript(src, function(){console.log('[CRM FIX] ✅ '+src+' loaded'); next();});
+            loadScript(src, function(){console.log('[CRM FIX] ' + src+' loaded'); next();});
         }
         next();
     }
-    var base='/static/js/';
-    // Order: existing legacy first (some depend on each other), then new modules, then v2 patches last.
-    // NOTE: all modules moved to root /static/js/ — PyInstaller Flask doesn't serve subdirectories
-    var queue = [
-        base+'settings_state_restore.js',
-        base+'cabinet_enable_consent.js',
-        base+'scheduled_enable.js',
-        base+'scheduled_enable_ui.js',
-        base+'snapshot_collector.js',
-        base+'stop_all.js',
-        base+'dynamic_frequency.js',
-        base+'creo_tracker.js',
-        // v2 modules (moved from modules/ to root)
-        base+'retry_queue.js',
-        base+'token_monitor.js',
-        base+'reject_tracker.js',
-        base+'geo_toggle.js',
-        // monkey-patches that depend on the above
-        base+'afk_optimizer.js',
-        base+'crm_v2_patches.js'
-    ];
-    loadAll(queue);
+    loadAll([
+        '/static/js/settings_state_restore.js',
+        '/static/js/cabinet_enable_consent.js',
+        '/static/js/scheduled_enable.js',
+        '/static/js/scheduled_enable_ui.js',
+        '/static/js/snapshot_collector.js',
+        '/static/js/stop_all.js',
+        '/static/js/dynamic_frequency.js',
+        '/static/js/creo_tracker.js',
+        '/static/js/retry_queue.js',
+        '/static/js/token_monitor.js',
+        '/static/js/reject_tracker.js',
+        '/static/js/geo_toggle.js',
+        '/static/js/afk_optimizer.js',
+        '/static/js/crm_v2_patches.js'
+    ]);
 })();
