@@ -355,7 +355,7 @@
         };
         console.log("[CRM FIX v3] Patched renderResults (active-only stats)");
     }
-    console.log("[CRM FIX v3.9] Loaded: lead count fix + settings wrap + all v3.7 features");
+    console.log("[CRM FIX v3.10] Loaded: lead count fix + settings wrap + token health bar + all v3.7 features");
 })();
 
 // Auto-load modules
@@ -390,6 +390,7 @@
         '/static/js/reject_tracker.js',
         '/static/js/geo_toggle.js',
         '/static/js/afk_optimizer.js',
-        '/static/js/crm_v2_patches.js'
+        '/static/js/crm_v2_patches.js',
+        '/static/js/token_health_ui.js'
     ]);
 })();
