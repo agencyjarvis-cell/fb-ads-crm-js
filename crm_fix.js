@@ -345,7 +345,17 @@
         };
         console.log("[CRM FIX v3] Patched recomputeStatsFromRows (active-only leads)");
     }
-    console.log("[CRM FIX v3.8] Loaded: lead count fix + settings wrap + all v3.7 features");
+    // Patch renderResults to recalculate stats using active-only filter (fixes 300 vs 227 in gradient bar)
+    var _origRenderResults=window.renderResults;
+    if(typeof _origRenderResults==="function"){
+        window.renderResults=function(data,stats,settings){
+            var recalc=typeof window.recomputeStatsFromRows==="function"?window.recomputeStatsFromRows(Array.isArray(data)?data:[]):stats;
+            console.log("[CRM FIX v3] renderResults stats override: API="+((stats||{}).total_leads||0)+" → active="+recalc.total_leads);
+            return _origRenderResults.call(this,data,recalc,settings);
+        };
+        console.log("[CRM FIX v3] Patched renderResults (active-only stats)");
+    }
+    console.log("[CRM FIX v3.9] Loaded: lead count fix + settings wrap + all v3.7 features");
 })();
 
 // Auto-load modules
