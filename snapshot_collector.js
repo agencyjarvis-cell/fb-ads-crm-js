@@ -13,7 +13,7 @@
     'use strict';
 
     var DB_NAME = 'fb_ads_snapshots';
-    var DB_VERSION = 1;
+    var DB_VERSION = 2;
     var STORE_NAME = 'snapshots';
     var INTERVAL_MS = 30 * 60 * 1000;
     var db = null;
@@ -29,10 +29,17 @@
         var req = indexedDB.open(DB_NAME, DB_VERSION);
         req.onupgradeneeded = function(e) {
             var d = e.target.result;
+            var store;
             if (!d.objectStoreNames.contains(STORE_NAME)) {
-                var store = d.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
+                store = d.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
                 store.createIndex('timestamp', 'timestamp', { unique: false });
                 store.createIndex('date', 'date', { unique: false });
+                store.createIndex('synced', 'synced', { unique: false });
+            } else {
+                store = e.target.transaction.objectStore(STORE_NAME);
+                if (!store.indexNames.contains('synced')) {
+                    store.createIndex('synced', 'synced', { unique: false });
+                }
             }
         };
         req.onsuccess = function(e) {
@@ -57,6 +64,7 @@
     function saveSnapshot(snapshot, callback) {
         if (!db) return;
         var tx = db.transaction(STORE_NAME, 'readwrite');
+        snapshot.synced = false;
         var req = tx.objectStore(STORE_NAME).add(snapshot);
         req.onsuccess = function() {
             snapshotCount++;
@@ -354,6 +362,297 @@
         xhr.send(JSON.stringify(snapshot));
     }
 
+    
+    // ═══ SCHEDULED SYNC MODULE ═══
+    var SYNC_SCHEDULE_HOURS = [6, 20]; // 06:00 and 20:00 Kyiv time
+    var SYNC_RETRY_DELAYS = [60, 300, 900, 3600]; // 1m, 5m, 15m, 1h
+    var SYNC_MAX_BATCH = 100;
+    var syncRetryIndex = 0;
+    var syncRetryTimer = null;
+    var syncInProgress = false;
+
+    function getKyivHour() {
+        try {
+            var s = new Date().toLocaleString('en-US', { timeZone: 'Europe/Kiev', hour12: false });
+            return parseInt(s.split(',')[1].trim().split(':')[0]);
+        } catch(e) { return new Date().getHours(); }
+    }
+
+    function getKyivTimeStr() {
+        try {
+            return new Date().toLocaleString('uk-UA', { timeZone: 'Europe/Kiev', hour: '2-digit', minute: '2-digit' });
+        } catch(e) { return new Date().toLocaleTimeString(); }
+    }
+
+    function getSyncStatus() {
+        try {
+            var raw = localStorage.getItem('snapshot_sync_status');
+            return raw ? JSON.parse(raw) : {};
+        } catch(e) { return {}; }
+    }
+
+    function saveSyncStatus(status) {
+        try {
+            localStorage.setItem('snapshot_sync_status', JSON.stringify(status));
+        } catch(e) {}
+    }
+
+    function getUnsyncedSnapshots(callback) {
+        if (!db) return callback([]);
+        var tx = db.transaction(STORE_NAME, 'readonly');
+        var store = tx.objectStore(STORE_NAME);
+        var results = [];
+        var req = store.openCursor();
+        req.onsuccess = function(e) {
+            var cursor = e.target.result;
+            if (cursor) {
+                if (!cursor.value.synced) {
+                    results.push(cursor.value);
+                }
+                cursor.continue();
+            } else {
+                callback(results);
+            }
+        };
+        req.onerror = function() { callback([]); };
+    }
+
+    function markAsSynced(ids, callback) {
+        if (!db || !ids.length) { if (callback) callback(); return; }
+        var tx = db.transaction(STORE_NAME, 'readwrite');
+        var store = tx.objectStore(STORE_NAME);
+        var done = 0;
+        for (var i = 0; i < ids.length; i++) {
+            (function(id) {
+                var getReq = store.get(id);
+                getReq.onsuccess = function() {
+                    var record = getReq.result;
+                    if (record) {
+                        record.synced = true;
+                        record.syncedAt = new Date().toISOString();
+                        store.put(record);
+                    }
+                    done++;
+                    if (done >= ids.length && callback) callback();
+                };
+                getReq.onerror = function() {
+                    done++;
+                    if (done >= ids.length && callback) callback();
+                };
+            })(ids[i]);
+        }
+    }
+
+    function syncToServer(isRetry) {
+        if (!SYNC_ENABLED) {
+            console.log('[Snapshot Sync] Server not configured. Use: snapshotAPI.server(url, token)');
+            return;
+        }
+        if (syncInProgress) {
+            console.log('[Snapshot Sync] Already in progress, skipping');
+            return;
+        }
+
+        syncInProgress = true;
+        console.log('[Snapshot Sync] Starting sync at ' + getKyivTimeStr() + '...');
+
+        getUnsyncedSnapshots(function(unsynced) {
+            if (unsynced.length === 0) {
+                console.log('[Snapshot Sync] All snapshots already synced');
+                syncInProgress = false;
+                syncRetryIndex = 0;
+                saveSyncStatus({
+                    lastSync: new Date().toISOString(),
+                    lastStatus: 'ok',
+                    unsyncedCount: 0,
+                    kyivTime: getKyivTimeStr()
+                });
+                updateSyncUI('ok', 0);
+                return;
+            }
+
+            console.log('[Snapshot Sync] Found ' + unsynced.length + ' unsynced snapshots');
+
+            // Batch in chunks of SYNC_MAX_BATCH
+            var batches = [];
+            for (var i = 0; i < unsynced.length; i += SYNC_MAX_BATCH) {
+                batches.push(unsynced.slice(i, i + SYNC_MAX_BATCH));
+            }
+
+            var batchIndex = 0;
+            var totalSynced = 0;
+            var totalFailed = 0;
+
+            function processBatch() {
+                if (batchIndex >= batches.length) {
+                    // All batches done
+                    syncInProgress = false;
+                    var allOk = totalFailed === 0;
+                    console.log('[Snapshot Sync] Done: ' + totalSynced + ' synced, ' + totalFailed + ' failed');
+
+                    saveSyncStatus({
+                        lastSync: new Date().toISOString(),
+                        lastStatus: allOk ? 'ok' : 'partial',
+                        syncedCount: totalSynced,
+                        failedCount: totalFailed,
+                        kyivTime: getKyivTimeStr()
+                    });
+
+                    if (allOk) {
+                        syncRetryIndex = 0;
+                        updateSyncUI('ok', 0);
+                    } else {
+                        scheduleRetry();
+                        updateSyncUI('error', totalFailed);
+                    }
+                    return;
+                }
+
+                var batch = batches[batchIndex];
+                // Strip the 'id' and 'synced' fields before sending (server assigns its own IDs)
+                var payload = batch.map(function(s) {
+                    var copy = {};
+                    for (var k in s) {
+                        if (k !== 'id' && k !== 'synced' && k !== 'syncedAt') copy[k] = s[k];
+                    }
+                    return copy;
+                });
+
+                var xhr = new XMLHttpRequest();
+                xhr.open('POST', SERVER_URL + '/api/snapshot/batch', true);
+                xhr.setRequestHeader('Content-Type', 'application/json');
+                xhr.setRequestHeader('X-Snapshot-Token', SERVER_TOKEN);
+                xhr.timeout = 30000;
+
+                xhr.onload = function() {
+                    if (xhr.status === 200) {
+                        try {
+                            var resp = JSON.parse(xhr.responseText);
+                            if (resp.ok || resp.received > 0) {
+                                // Mark successfully synced snapshots
+                                var syncedIds = [];
+                                if (resp.results) {
+                                    for (var r = 0; r < resp.results.length; r++) {
+                                        if (resp.results[r].ok) {
+                                            syncedIds.push(batch[resp.results[r].index].id);
+                                        }
+                                    }
+                                } else {
+                                    // All ok if no per-item results
+                                    syncedIds = batch.map(function(s) { return s.id; });
+                                }
+                                totalSynced += syncedIds.length;
+                                totalFailed += (batch.length - syncedIds.length);
+
+                                markAsSynced(syncedIds, function() {
+                                    console.log('[Snapshot Sync] Batch ' + (batchIndex + 1) + '/' + batches.length + ': ' + syncedIds.length + '/' + batch.length + ' ok');
+                                    batchIndex++;
+                                    processBatch();
+                                });
+                                return;
+                            }
+                        } catch(e) {}
+                    }
+                    // HTTP error or parse error
+                    totalFailed += batch.length;
+                    console.warn('[Snapshot Sync] Batch ' + (batchIndex + 1) + ' failed: HTTP ' + xhr.status);
+                    batchIndex++;
+                    processBatch();
+                };
+
+                xhr.onerror = function() {
+                    totalFailed += batch.length;
+                    console.warn('[Snapshot Sync] Batch ' + (batchIndex + 1) + ' network error');
+                    batchIndex++;
+                    processBatch();
+                };
+
+                xhr.ontimeout = function() {
+                    totalFailed += batch.length;
+                    console.warn('[Snapshot Sync] Batch ' + (batchIndex + 1) + ' timeout');
+                    batchIndex++;
+                    processBatch();
+                };
+
+                xhr.send(JSON.stringify({ snapshots: payload }));
+            }
+
+            processBatch();
+        });
+    }
+
+    function scheduleRetry() {
+        if (syncRetryTimer) clearTimeout(syncRetryTimer);
+        if (syncRetryIndex >= SYNC_RETRY_DELAYS.length) {
+            console.warn('[Snapshot Sync] Max retries reached, will try at next scheduled time');
+            syncRetryIndex = 0;
+            return;
+        }
+        var delay = SYNC_RETRY_DELAYS[syncRetryIndex];
+        console.log('[Snapshot Sync] Retry in ' + delay + 's (attempt ' + (syncRetryIndex + 1) + ')');
+        syncRetryTimer = setTimeout(function() {
+            syncRetryIndex++;
+            syncToServer(true);
+        }, delay * 1000);
+    }
+
+    function startSyncScheduler() {
+        // Check every 5 minutes if it's time to sync
+        setInterval(function() {
+            var hour = getKyivHour();
+            var minute;
+            try {
+                var s = new Date().toLocaleString('en-US', { timeZone: 'Europe/Kiev', hour12: false });
+                minute = parseInt(s.split(':')[1]);
+            } catch(e) { minute = new Date().getMinutes(); }
+
+            // Trigger sync at HH:00-HH:04 for scheduled hours
+            if (SYNC_SCHEDULE_HOURS.indexOf(hour) !== -1 && minute < 5) {
+                var status = getSyncStatus();
+                var lastSync = status.lastSync ? new Date(status.lastSync) : null;
+                var now = new Date();
+                // Don't sync if last sync was less than 30 min ago (prevent double trigger)
+                if (!lastSync || (now - lastSync) > 30 * 60 * 1000) {
+                    console.log('[Snapshot Sync] Scheduled sync triggered at ' + getKyivTimeStr());
+                    syncToServer(false);
+                }
+            }
+        }, 5 * 60 * 1000); // every 5 min
+
+        console.log('[Snapshot Sync] Scheduler started (sync at ' + SYNC_SCHEDULE_HOURS.join(':00, ') + ':00 Kyiv)');
+    }
+
+    function startupSync() {
+        // On CRM startup, check if there are unsynced snapshots and sync them
+        if (!SYNC_ENABLED) return;
+        setTimeout(function() {
+            getUnsyncedSnapshots(function(unsynced) {
+                if (unsynced.length > 0) {
+                    console.log('[Snapshot Sync] Startup: found ' + unsynced.length + ' unsynced, syncing...');
+                    syncToServer(false);
+                } else {
+                    console.log('[Snapshot Sync] Startup: all synced');
+                }
+            });
+        }, 30000); // 30s after startup (let CRM initialize first)
+    }
+
+    function updateSyncUI(status, pendingCount) {
+        var el = document.getElementById('snapshot-sync-status');
+        if (!el) return;
+        if (status === 'ok') {
+            el.textContent = 'synced';
+            el.style.color = '#00ff88';
+        } else if (status === 'error') {
+            el.textContent = pendingCount + ' pending';
+            el.style.color = '#ff4444';
+        } else {
+            el.textContent = 'syncing...';
+            el.style.color = '#ffaa00';
+        }
+    }
+
+
     function configureServer(url, token) {
         SERVER_URL = (url || '').replace(/\/+$/, '');
         SERVER_TOKEN = token || '';
@@ -409,7 +708,7 @@
         w.id = 'snapshot-widget';
         w.style.cssText = 'position:fixed;bottom:10px;right:10px;z-index:99999;background:#1a1a2e;border:1px solid #16213e;border-radius:8px;padding:6px 10px;font-family:monospace;font-size:12px;color:#e0e0e0;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 8px rgba(0,0,0,0.3);user-select:none;';
         w.title = 'Snapshot Collector';
-        w.innerHTML = '<span style="font-size:14px">S</span><span id="snapshot-count" style="color:#00d4ff;font-weight:bold">0</span><span style="color:#888;font-size:10px">snaps</span><span id="snapshot-timer" style="color:#888;font-size:10px"></span><span id="snapshot-status" style="width:6px;height:6px;border-radius:50%;background:#00ff88;display:inline-block"></span>';
+        w.innerHTML = '<span style="font-size:14px">S</span><span id="snapshot-count" style="color:#00d4ff;font-weight:bold">0</span><span style="color:#888;font-size:10px">snaps</span><span id="snapshot-timer" style="color:#888;font-size:10px"></span><span id="snapshot-sync-status" style="color:#888;font-size:10px"></span><span id="snapshot-status" style="width:6px;height:6px;border-radius:50%;background:#00ff88;display:inline-block"></span>';
         w.addEventListener('click', function(e) { e.stopPropagation(); toggleMenu(); });
         document.body.appendChild(w);
 
@@ -418,6 +717,7 @@
         menu.style.cssText = 'position:fixed;bottom:40px;right:10px;z-index:100000;background:#1a1a2e;border:1px solid #16213e;border-radius:8px;padding:8px;font-family:monospace;font-size:12px;color:#e0e0e0;display:none;box-shadow:0 4px 12px rgba(0,0,0,0.4);min-width:160px;';
         var btns = [
             { t: 'Snap Now', fn: captureSnapshot },
+            { t: 'Sync Now', fn: function() { syncToServer(false); } },
             { t: 'Export JSON', fn: exportSnapshots },
             { t: 'Stop Auto', fn: function() { stopAutoCapture(); updateUI(); } },
             { t: 'Start Auto', fn: function() { startAutoCapture(); updateUI(); } },
@@ -472,7 +772,11 @@
             console.log('[Snapshot] Interval: ' + min + ' min');
         },
         server: configureServer,
-        syncStatus: function() { return { enabled: SYNC_ENABLED, url: SERVER_URL }; },
+        syncStatus: function() {
+            var s = getSyncStatus();
+            return { enabled: SYNC_ENABLED, url: SERVER_URL, lastSync: s.lastSync, lastStatus: s.lastStatus, unsyncedCount: s.unsyncedCount };
+        },
+        syncNow: syncToServer,
         status: function() {
             return {
                 count: snapshotCount,
@@ -487,6 +791,8 @@
     openDB(function() {
         createUI();
         startAutoCapture();
+        startSyncScheduler();
+        startupSync();
         setTimeout(function() {
             if (window.lastResults && window.lastResults.length > 0) {
                 captureSnapshot();
@@ -494,5 +800,5 @@
         }, 10000);
     });
 
-    console.log('[Snapshot v2.0] Ghost fix + deltas + max_leads + aggregates, 30min, IndexedDB + server sync');
+    console.log('[Snapshot v3.0] Ghost fix + deltas + aggregates + scheduled cloud sync (06:00/20:00 Kyiv)');
 })();

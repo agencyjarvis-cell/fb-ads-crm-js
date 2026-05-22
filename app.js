@@ -3482,6 +3482,8 @@
 
                 console.log(`✅ [AFK] Перевірки пройдено, запускаю АФК режим...`);
                 isAutoRefreshActive = true;
+                // 🔧 FIX: Скидаємо паузи при увімкненні АФК (щоб всі кабінети були активні)
+                clearCabinetsPausedState();
                 if (statusDiv) statusDiv.style.display = 'block';
                 startAutoRefresh(interval);
                 console.log(`🔄 [AFK] Auto-refresh запущено з інтервалом ${interval} хв, кабінетів: ${uniqueSelected.length}`);
@@ -3591,6 +3593,12 @@
 
            console.log('✅ [AFK] Всі перевірки пройдено, намагаюсь отримати lock...');
 
+
+           // 🌍 Skip if geo toggle operation is running (prevents server overload)
+           if (window._geoRunning) {
+               console.warn('⚠️ [AFK] Auto-refresh пропущено: geo toggle операція активна, спробую наступного разу');
+               return;
+           }
            // 🔒 Перевірка глобального lock (silent mode для АФК)
            if (!acquireLock('AFK режим: автооновлення', true)) {
                console.warn('⚠️ [AFK] Auto-refresh пропущено: зайнята інша операція (lock), спробую наступного разу');
@@ -3608,11 +3616,31 @@
             console.log(`📊 [AFK] activeCabinets після фільтру cabinetsToUpdate: ${activeCabinets.length} кабінетів`);
 
             // Фільтруємо кабінети які на паузі (не оновлюємо їх в АФК режимі)
-            const cabinetsToRefresh = activeCabinets.filter(id => !cabinetsPaused.has(id));
-            const pausedCount = activeCabinets.length - cabinetsToRefresh.length;
+            const notPaused = activeCabinets.filter(id => !cabinetsPaused.has(id));
 
-            console.log(`📊 [AFK] cabinetsToRefresh (після виключення паузи): ${cabinetsToRefresh.length} кабінетів`);
-            console.log(`⏸️ [AFK] cabinetsPaused: ${pausedCount} кабінетів`);
+            // ⚡ ОПТИМІЗАЦІЯ: пропускаємо кабінети без активних КАМПАНІЙ
+            // Адсети можуть вмикатись/вимикатись авторулами — це нормально.
+            // Але якщо ВСІ кампанії кабінету PAUSED — оновлювати нема чого.
+            const cabinetsToRefresh = notPaused.filter(id => {
+                if (!window.lastResults || !window.lastResults.length) return true;
+                const normalizedId = normalizeCabinetId(id);
+                const cabinetRows = window.lastResults.filter(r => getRowCabinetId(r) === normalizedId);
+                if (!cabinetRows.length) return true;
+                const hasActiveCampaign = cabinetRows.some(r => {
+                    var cs = (r.campaign_status || r.campaign_effective_status || '').toUpperCase();
+                    return cs === 'ACTIVE';
+                });
+                if (!hasActiveCampaign) {
+                    console.log(`⏭️ [AFK] Пропущено кабінет ${id} — всі кампанії PAUSED`);
+                }
+                return hasActiveCampaign;
+            });
+
+            const pausedCount = activeCabinets.length - notPaused.length;
+            const skippedNoActive = notPaused.length - cabinetsToRefresh.length;
+
+            console.log(`📊 [AFK] cabinetsToRefresh: ${cabinetsToRefresh.length} кабінетів (з активними кампаніями)`);
+            console.log(`⏸️ [AFK] paused: ${pausedCount}, без активних кампаній: ${skippedNoActive}`);
 
             if (pausedCount > 0) {
                 console.log(`⏸️ Пропущено ${pausedCount} кабінетів на паузі`);
@@ -3906,6 +3934,8 @@
                 return;
             }
 
+            // 🔧 FIX: Скидаємо паузи при перепроходженні кроку 3
+            clearCabinetsPausedState();
             // ✅ ВИПРАВЛЕННЯ: Синхронізуємо cabinetsToUpdate з поточним selectedAdaccounts
             // Видаляємо кабінети які більше не вибрані на Кроці 2
             const uniqueSelected = getUniqueSelectedAdaccounts();
@@ -4042,6 +4072,15 @@
             localStorage.removeItem('cabinetsPaused');
             console.log('⏸️ Скинуто всі паузи');
         }
+
+        // 🔧 FIX: Bridge for scheduled_enable.js to un-pause specific cabinet
+        window.unpauseCabinetForAfk = function(cabinetId) {
+            if (cabinetsPaused.has(cabinetId)) {
+                cabinetsPaused.delete(cabinetId);
+                saveCabinetsPausedState();
+                console.log('🔓 Un-paused cabinet' + cabinetId + 'from AFK (scheduled enable)');
+            }
+        };
 
         function toggleCabinetPause(cabinetId) {
             if (cabinetsPaused.has(cabinetId)) {

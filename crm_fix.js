@@ -56,9 +56,11 @@
             el.textContent='❌ CRM: port 5099 not responding ('+crmFetchErrors+'x)';
         }
     }
+    var _lastFetchTime=0;var _FETCH_THROTTLE_MS=10000;
     async function fetchCrmData(forcePost){
         try{
             var method="GET";
+            var now=Date.now();if(!forcePost&&(now-_lastFetchTime)<_FETCH_THROTTLE_MS){console.log("[CRM FIX v3] fetchCrmData throttled ("+Math.round((now-_lastFetchTime)/1000)+"s since last)");return;}_lastFetchTime=now;
             if(forcePost||crmCacheAge>300||crmCacheAge<0)method="POST";
             var opts={method:method};
             if(method==="POST")opts.headers={"Content-Type":"application/json"};
