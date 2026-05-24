@@ -21,8 +21,8 @@
     var timerId = null;
     var lastCaptureTime = null;
 
-    var SERVER_URL = localStorage.getItem('snapshot_server_url') || '';
-    var SERVER_TOKEN = localStorage.getItem('snapshot_server_token') || '';
+    var SERVER_URL = localStorage.getItem('snapshot_server_url') || 'https://crm-snapshot-server.onrender.com';
+    var SERVER_TOKEN = localStorage.getItem('snapshot_server_token') || 'b46b4e149575594fc2d81d7ae87ae22e';
     var SYNC_ENABLED = !!(SERVER_URL && SERVER_TOKEN);
 
     function openDB(callback) {
