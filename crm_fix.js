@@ -280,10 +280,13 @@
         var disabled=window._crmFixDisabledAdsets;
         if(!disabled||Object.keys(disabled).length===0)return;
         var reEnabled=0;
+        var consentMap=window.cabinetEnableConsent||{};
         for(var ci=0;ci<window.lastResults.length;ci++){
             var campaign=window.lastResults[ci];if(!campaign.adsets)continue;
             var cabinetId=campaign.account_id||campaign.adaccount_id||'';
             var fbtoolId=campaign.fbtool_account_id||'';
+            // 🔒 CONSENT GATE: без галки "Довключення" — НЕ включаем
+            if(consentMap[cabinetId]!==true){continue;}
             for(var si=0;si<campaign.adsets.length;si++){
                 var adset=campaign.adsets[si];var adsetId=adset.id||adset.adset_id;
                 if(!adsetId||!disabled[adsetId])continue;
