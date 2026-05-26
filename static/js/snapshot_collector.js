@@ -419,6 +419,7 @@
             delta_spend: deltaSpend,
             delta_leads: deltaLeads,
             ghost_campaigns_filtered: ghostCampaigns,
+            data_quality: dataQuality,
             version: 5
         };
     }
