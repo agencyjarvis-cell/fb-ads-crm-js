@@ -12,7 +12,7 @@
 (function() {
     'use strict';
 
-    var DB_NAME = 'fb_ads_snapshots';
+    var DB_NAME = 'fb_ads_snapshots_v3';
     var DB_VERSION = 2;
     var STORE_NAME = 'snapshots';
     var INTERVAL_MS = 30 * 60 * 1000;
