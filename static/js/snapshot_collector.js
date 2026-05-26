@@ -852,3 +852,30 @@
         syncStatus: function() {
             var s = getSyncStatus();
             return { enabled: SYNC_ENABLED, url: SERVER_URL, lastSync: s.lastSync, lastStatus: s.lastStatus, unsyncedCount: s.unsyncedCount };
+        },
+        syncNow: syncToServer,
+        status: function() {
+            return {
+                count: snapshotCount,
+                autoActive: !!timerId,
+                intervalMin: INTERVAL_MS / 60000,
+                lastCapture: lastCaptureTime ? new Date(lastCaptureTime).toLocaleTimeString() : 'never',
+                serverSync: SYNC_ENABLED
+            };
+        }
+    };
+
+    openDB(function() {
+        createUI();
+        startAutoCapture();
+        startSyncScheduler();
+        startupSync();
+        setTimeout(function() {
+            if (window.lastResults && window.lastResults.length > 0) {
+                captureSnapshot();
+            }
+        }, 10000);
+    });
+
+    console.log('[Snapshot v3.0] Ghost fix + deltas + aggregates + scheduled cloud sync (06:00/20:00 Kyiv)');
+})();
