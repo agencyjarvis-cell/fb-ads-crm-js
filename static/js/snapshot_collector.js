@@ -246,6 +246,9 @@
             // FIX: skip ghost campaigns (spend>0 but all adsets filtered as paused)
             if (adsets.length === 0) { ghostCampaigns++; continue; }
 
+            // FIX: skip ghost campaigns (spend>0 but all adsets filtered as paused)
+            if (adsets.length === 0) { ghostCampaigns++; continue; }
+
             var cd = calcDerived(campaign);
             cabinetsMap[cabId].campaigns.push({
                 campaign_id: campaign.campaign_id || '',
@@ -367,6 +370,37 @@
         if (trackedCount > 5 && leadDropCount / trackedCount > 0.3) {
             console.warn('[Snapshot] CRM GLITCH DETECTED: ' + leadDropCount + '/' + trackedCount + ' adsets lost leads. Skipping snapshot.');
             return null;
+        }
+
+        // FIX: detect partial data — flag if cabinets dropped >50% from previous
+        var prevCabCount = parseInt(localStorage.getItem('snapshot_prev_cab_count') || '0');
+        var dataQuality = 'ok';
+        if (prevCabCount > 3 && cabinets.length < prevCabCount * 0.5) {
+            dataQuality = 'partial';
+            console.warn('[Snapshot] PARTIAL DATA: ' + cabinets.length + ' cabs vs ' + prevCabCount + ' previous. Flagging snapshot.');
+        }
+        if (cabinets.length > 0) {
+            localStorage.setItem('snapshot_prev_cab_count', String(Math.max(prevCabCount, cabinets.length)));
+        }
+
+        // FIX: detect mass lead reset — flag if >30% of tracked adsets show leads=0
+        var leadDropCount = 0, trackedCount = 0;
+        for (var lci = 0; lci < cabinets.length; lci++) {
+            for (var lcj = 0; lcj < cabinets[lci].campaigns.length; lcj++) {
+                var lcamp = cabinets[lci].campaigns[lcj];
+                for (var lck = 0; lck < (lcamp.adsets ? lcamp.adsets.length : 0); lck++) {
+                    var las = lcamp.adsets[lck];
+                    var lasMemKey = 'adset_' + las.id;
+                    if (maxLeadsMemory[lasMemKey] && maxLeadsMemory[lasMemKey] > 2) {
+                        trackedCount++;
+                        if (las.leads === 0) leadDropCount++;
+                    }
+                }
+            }
+        }
+        if (trackedCount > 5 && leadDropCount / trackedCount > 0.3) {
+            dataQuality = 'glitch';
+            console.warn('[Snapshot] CRM GLITCH: ' + leadDropCount + '/' + trackedCount + ' adsets lost leads. Flagging snapshot.');
         }
 
         return {
@@ -817,30 +851,3 @@
         syncStatus: function() {
             var s = getSyncStatus();
             return { enabled: SYNC_ENABLED, url: SERVER_URL, lastSync: s.lastSync, lastStatus: s.lastStatus, unsyncedCount: s.unsyncedCount };
-        },
-        syncNow: syncToServer,
-        status: function() {
-            return {
-                count: snapshotCount,
-                autoActive: !!timerId,
-                intervalMin: INTERVAL_MS / 60000,
-                lastCapture: lastCaptureTime ? new Date(lastCaptureTime).toLocaleTimeString() : 'never',
-                serverSync: SYNC_ENABLED
-            };
-        }
-    };
-
-    openDB(function() {
-        createUI();
-        startAutoCapture();
-        startSyncScheduler();
-        startupSync();
-        setTimeout(function() {
-            if (window.lastResults && window.lastResults.length > 0) {
-                captureSnapshot();
-            }
-        }, 10000);
-    });
-
-    console.log('[Snapshot v3.0] Ghost fix + deltas + aggregates + scheduled cloud sync (06:00/20:00 Kyiv)');
-})();
