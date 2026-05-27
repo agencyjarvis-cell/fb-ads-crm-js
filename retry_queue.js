@@ -6,8 +6,12 @@
     'use strict';
 
     var MAX_PENDING = 10;
-    var RETRY_DELAYS = [10000, 30000]; // 10s, 30s
+    var RETRY_DELAYS = [15000, 60000, 180000]; // 15s, 1min, 3min
     var _pendingRetries = {};
+    var CIRCUIT_THRESHOLD = 5;
+    var CIRCUIT_COOLDOWN = 10 * 60 * 1000; // 10 min pause after 5 consecutive failures
+    var _consecutiveFailures = 0;
+    var _circuitOpenUntil = 0;
 
     window._autorulesRetryQueue = _pendingRetries;
 
@@ -20,6 +24,16 @@
      * @returns {Promise<boolean>}
      */
     async function executeWithRetry(adsetId, action, params, onSuccess) {
+        // Circuit breaker: if too many consecutive failures, skip ALL retries
+        if (Date.now() < _circuitOpenUntil) {
+            console.warn('[RETRY] Circuit breaker open (' + Math.round((_circuitOpenUntil - Date.now()) / 60000) + 'min left). Skipping ' + adsetId);
+            return false;
+        }
+        // Dedup: don't retry if scheduled_enable is already retrying this adset
+        if (window._retryQueue && window._retryQueue[adsetId]) {
+            console.log('[RETRY] Skipping ' + adsetId + ' — already in scheduled_enable retry queue');
+            return false;
+        }
         // Atomic cap check: reserve a slot BEFORE awaiting so concurrent failures
         // cannot all pass the cap check and bypass MAX_PENDING.
         if (!_pendingRetries[adsetId]) {
@@ -60,6 +74,12 @@
                     ' for ' + adsetId + ' in ' + (delay / 1000) + 's');
 
         var timerId = setTimeout(async function() {
+            // Check circuit breaker before firing scheduled retry
+            if (Date.now() < _circuitOpenUntil) {
+                console.log('[RETRY] Circuit open, cancelling scheduled retry for ' + adsetId);
+                delete _pendingRetries[adsetId];
+                return;
+            }
             console.log('[RETRY] Retry ' + (retryIndex + 1) + ' firing for ' + adsetId);
             var result = await doApiCall(adsetId, action, params);
 
@@ -96,13 +116,27 @@
             });
 
             if (!resp.ok) {
+                _consecutiveFailures++;
+                if (_consecutiveFailures >= CIRCUIT_THRESHOLD) {
+                    _circuitOpenUntil = Date.now() + CIRCUIT_COOLDOWN;
+                    _consecutiveFailures = 0;
+                    console.error('[RETRY] Circuit breaker OPEN! ' + CIRCUIT_THRESHOLD + ' consecutive API failures. Pausing retries for 10 min.');
+                }
                 console.error('[RETRY] HTTP ' + resp.status + ' for ' + adsetId);
                 return { success: false, status: resp.status };
             }
+            // Success resets circuit breaker
+            _consecutiveFailures = 0;
 
             var data = await resp.json();
             return { success: !!data.success, data: data };
         } catch (e) {
+            _consecutiveFailures++;
+            if (_consecutiveFailures >= CIRCUIT_THRESHOLD) {
+                _circuitOpenUntil = Date.now() + CIRCUIT_COOLDOWN;
+                _consecutiveFailures = 0;
+                console.error('[RETRY] Circuit breaker OPEN! Network errors. Pausing retries for 10 min.');
+            }
             console.error('[RETRY] Network error for ' + adsetId + ': ' + e.message);
             return { success: false, error: e.message };
         }

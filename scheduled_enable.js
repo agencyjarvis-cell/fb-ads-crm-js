@@ -215,8 +215,7 @@
             var data = await resp.json();
             if (data.success) {
                 console.log('[TIMER] ✅ ' + adsetId + ' ENABLED at ' + formatKyiv(getKyivNow()) + ' Kyiv');
-                // 🔧 FIX: Un-pause cabinet from AFK when scheduled enable fires
-                if (cabinet && cabinet.id && typeof window.unpauseCabinetForAfk === "function") { window.unpauseCabinetForAfk(cabinet.id); }
+                if (cabinet && cabinet.id && typeof window.unpauseCabinetForAfk === 'function') { window.unpauseCabinetForAfk(cabinet.id); }
                 if (window._retryQueue[adsetId]) delete window._retryQueue[adsetId];
                 return true;
             } else {

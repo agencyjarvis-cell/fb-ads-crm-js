@@ -1,8 +1,9 @@
 /**
- * token_health_ui.js - T-CRM-TOKEN-HEALTH v1.3
+ * token_health_ui.js - T-CRM-TOKEN-HEALTH v1.5
  * Per-profile token health bar in header.
- * Only shows SELECTED profiles from Step 1 (window.selectedAccounts).
- * Grey dot = no data yet. Green = OK. Red = error/stale.
+ * Profiles locked from FIRST successful /api/collect (via lastResults).
+ * Once locked, list never shrinks — dead tokens stay visible as red.
+ * Grey = no data yet. Green = OK (<5min). Red = error/stale.
  */
 (function() {
     'use strict';
@@ -11,31 +12,60 @@
     var UI_REFRESH_MS = 10 * 1000;
     var PANEL_ID      = 'tokenHealthBar';
 
+    // Locked profile map: fbtool_id -> { name, acctIds[] }
+    // Once locked, profiles only ADD, never remove.
+    if (!window._healthProfiles) window._healthProfiles = {};
+    var profiles = window._healthProfiles;
+    var profilesLocked = false;
+
     if (!window._acctHealth) window._acctHealth = {};
     var acctHealth = window._acctHealth;
 
     function norm(id) { return id ? String(id).replace(/^act_/, '') : ''; }
 
-    // ── Get selected profiles with names ────────────────────────────
-    function getSelectedProfiles() {
-        var sel = window.selectedAccounts;
-        if (!Array.isArray(sel) || sel.length === 0) return {};
+    // ── Lock profiles from lastResults rows ─────────────────────────
+    function lockFromResults() {
+        var rows = window.lastResults;
+        if (!Array.isArray(rows) || rows.length === 0) return false;
         var cache = window._profileNamesCache || {};
-        var result = {};
-        sel.forEach(function(fid) {
-            var key = String(fid);
-            result[key] = { name: cache[key] || ('Profile ' + key), acctIds: [] };
+        var found = 0;
+        rows.forEach(function(r) {
+            var fid = String(r.fbtool_account_id || '');
+            if (!fid) return;
+            var cid = norm(r.adaccount_id || r.account_id);
+            if (!profiles[fid]) {
+                var name = (cache[fid]) || r.fbtool_account_name || r.profile_name || r.profile || ('Profile ' + fid);
+                profiles[fid] = { name: name, acctIds: [] };
+                found++;
+            }
+            if (cid && profiles[fid].acctIds.indexOf(cid) === -1) {
+                profiles[fid].acctIds.push(cid);
+            }
         });
-        return result;
+        if (Object.keys(profiles).length > 0) {
+            if (!profilesLocked) {
+                profilesLocked = true;
+                console.log('[TOKEN-HEALTH] Locked ' + Object.keys(profiles).length + ' profiles from lastResults');
+            }
+            return true;
+        }
+        return false;
     }
 
-    function updateAcctMapping(profiles) {
+    // Also update acct mapping on subsequent collects (new cabs may appear)
+    function updateAcctMapping() {
         var rows = window.lastResults || [];
+        var cache = window._profileNamesCache || {};
         rows.forEach(function(r) {
-            var cid = norm(r.adaccount_id || r.account_id);
             var fid = String(r.fbtool_account_id || '');
-            if (!cid || !fid) return;
-            if (profiles[fid] && profiles[fid].acctIds.indexOf(cid) === -1) {
+            var cid = norm(r.adaccount_id || r.account_id);
+            if (!fid || !cid) return;
+            // Add new profile if not seen before (profile list only grows)
+            if (!profiles[fid]) {
+                var name = (cache[fid]) || r.fbtool_account_name || r.profile_name || r.profile || ('Profile ' + fid);
+                profiles[fid] = { name: name, acctIds: [] };
+            }
+            if (profiles[fid].acctIds.indexOf(cid) === -1) {
                 profiles[fid].acctIds.push(cid);
             }
         });
@@ -49,7 +79,7 @@
         else { h.lastErr = Date.now(); h.errType = status >= 500 ? 'server' : 'network'; }
     }
 
-    function trackAllSuccess(profiles) {
+    function trackAllSuccess() {
         var now = Date.now();
         Object.keys(profiles).forEach(function(fid) {
             profiles[fid].acctIds.forEach(function(aid) {
@@ -68,9 +98,9 @@
             return _prevFetch.apply(this, arguments).then(function(resp) {
                 if (resp.status >= 200 && resp.status < 400) {
                     setTimeout(function() {
-                        var p = getSelectedProfiles();
-                        updateAcctMapping(p);
-                        trackAllSuccess(p);
+                        lockFromResults();
+                        updateAcctMapping();
+                        trackAllSuccess();
                         renderPanel();
                     }, 500);
                 } else {
@@ -135,8 +165,6 @@
 
     // ── Aggregate ───────────────────────────────────────────────────
     function getRows() {
-        var profiles = getSelectedProfiles();
-        updateAcctMapping(profiles);
         var result = [];
         Object.keys(profiles).forEach(function(fid) {
             var p = profiles[fid];
@@ -165,24 +193,25 @@
         if (!panel) {
             panel = document.createElement('div');
             panel.id = PANEL_ID;
-            panel.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px 10px;padding:4px 10px;margin-top:6px;font-size:11px;font-family:monospace;color:rgba(255,255,255,0.9);';
+            panel.style.cssText = 'display:flex;flex-direction:column;gap:2px;padding:4px 10px;margin-top:6px;font-size:11px;font-family:monospace;color:rgba(255,255,255,0.9);';
             var headerLeft = document.querySelector('.header > div > div:first-child');
             if (!headerLeft) { var h1 = document.querySelector('.header h1'); headerLeft = h1 ? h1.parentElement : null; }
             if (headerLeft) headerLeft.appendChild(panel); else return;
         }
 
-        var sel = window.selectedAccounts;
-        if (!Array.isArray(sel) || sel.length === 0) {
+        if (!profilesLocked) {
+            // Try to lock from existing lastResults
+            lockFromResults();
+        }
+
+        if (Object.keys(profiles).length === 0) {
             panel.innerHTML = '';
             return;
         }
 
         var rows = getRows();
-        if (rows.length === 0) { panel.innerHTML = ''; return; }
-
         var html = '';
         rows.forEach(function(r) {
-            // Grey = no data, Green = OK, Red = error/stale
             var dotClr, dotShadow;
             if (!r.hasData) { dotClr = '#9ca3af'; dotShadow = 'none'; }
             else if (r.ok) { dotClr = '#4ade80'; dotShadow = '0 0 4px #4ade80'; }
@@ -194,30 +223,27 @@
             else if (r.elMin === 0) { timeStr = '<1m'; }
             else {
                 var clr = r.elMin > 5 ? '#ff6b6b' : r.elMin > 2 ? '#ffd93d' : '';
-                timeStr = clr ? '<span style="color:' + clr + ';">' + r.elMin + 'm</span>' : r.elMin + 'm';
+                timeStr = clr ? '<span style=\"color:' + clr + ';\">' + r.elMin + 'm</span>' : r.elMin + 'm';
             }
 
             var title = r.name + (r.cabs ? ' (' + r.cabs + ' cabs)' : '') + (r.errType ? ' | Error: ' + r.errType : '') + (r.elMin !== null ? ' | Last OK: ' + r.elMin + 'min ago' : ' | No data yet');
             var short = r.name.length > 16 ? r.name.substring(0, 14) + '..' : r.name;
 
-            html += '<span style="display:inline-flex;align-items:center;gap:3px;white-space:nowrap;" title="' + title + '">' +
-                '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + dotClr + ';box-shadow:' + dotShadow + ';flex-shrink:0;"></span>' +
+            html += '<span style=\"display:inline-flex;align-items:center;gap:3px;white-space:nowrap;\" title=\"' + title + '\">' +
+                '<span style=\"display:inline-block;width:8px;height:8px;border-radius:50%;background:' + dotClr + ';box-shadow:' + dotShadow + ';flex-shrink:0;\"></span>' +
                 '<span>' + short + '</span>' +
-                '<span style="opacity:0.7;">' + timeStr + '</span></span>';
+                '<span style=\"opacity:0.7;\">' + timeStr + '</span></span>';
         });
         panel.innerHTML = html;
     }
 
     // ── Init ────────────────────────────────────────────────────────
     function init() {
-        if (window.lastResults && window.lastResults.length > 0) {
-            var p = getSelectedProfiles();
-            updateAcctMapping(p);
-            trackAllSuccess(p);
-        }
+        lockFromResults();
+        if (profilesLocked) trackAllSuccess();
         renderPanel();
         setInterval(renderPanel, UI_REFRESH_MS);
-        console.log('[TOKEN-HEALTH] v1.3 init. Selected: ' + (window.selectedAccounts || []).length);
+        console.log('[TOKEN-HEALTH] v1.5 init. Locked: ' + profilesLocked + ', profiles: ' + Object.keys(profiles).length);
     }
 
     if (document.querySelector('.header h1')) { setTimeout(init, 2000); }
@@ -230,5 +256,5 @@
 
     window.getProfileHealth = getRows;
     window.refreshTokenHealthUI = renderPanel;
-    console.log('[TOKEN-HEALTH] v1.3 Loaded.');
+    console.log('[TOKEN-HEALTH] v1.5 Loaded.');
 })();

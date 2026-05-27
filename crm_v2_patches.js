@@ -144,17 +144,34 @@
     // ========================================================================
     // 3) T-CRM-V2-TIMER-GRP — группировка кабов в Timer по profile_name
     // ========================================================================
+    // Persistent profile name cache - survives AFK data merges
+    if (!window._profileNamesCache) {
+        window._profileNamesCache = {};
+        fetch('/api/accounts').then(function(r){ return r.json(); }).then(function(d) {
+            if (d.success && d.accounts) {
+                d.accounts.forEach(function(a) {
+                    if (a.id && a.name) window._profileNamesCache[String(a.id)] = a.name;
+                });
+                console.log('[PROFILE-NAMES] Cached ' + Object.keys(window._profileNamesCache).length + ' names');
+                var sec = document.getElementById('timerSection');
+                if (sec) { sec.removeAttribute('data-profile-grouped'); }
+            }
+        }).catch(function(e){ console.warn('[PROFILE-NAMES] cache load failed:', e); });
+    }
+
     function getProfileByCabId() {
         var map = {};
         var rows = window.lastResults || [];
+        var cache = window._profileNamesCache || {};
         rows.forEach(function(r){
             var cid = r.adaccount_id || r.account_id;
             if (!cid) return;
-            // Group by fbtool_account_id (= real profile), fallback to account_name
-            var pn = r.fbtool_account_id || r.profile_name || r.profile || r.account_name || cid;
-            // Make fbtool_account_id human-readable
-            if (r.fbtool_account_id && pn === r.fbtool_account_id) {
-                pn = 'Profile ' + r.fbtool_account_id;
+            var fid = String(r.fbtool_account_id || '');
+            var pn = (fid && cache[fid])
+                || r.fbtool_account_name || r.profile_name || r.profile
+                || (fid ? 'Profile ' + fid : r.account_name || cid);
+            if (fid && !cache[fid] && pn && pn.indexOf('Profile ') !== 0) {
+                cache[fid] = pn;
             }
             if (!map[cid]) map[cid] = pn;
         });
@@ -162,6 +179,7 @@
     }
 
     function groupTimerCabsByProfile() {
+        return; // DISABLED — purple headers handle profile grouping
         var section = document.getElementById('timerSection');
         if (!section || section.style.display === 'none') return;
         if (section.getAttribute('data-profile-grouped') === '1') return;
@@ -169,6 +187,9 @@
         window._timerGrpBusy = true;
         // Set flag BEFORE DOM changes to prevent MutationObserver infinite loop
         section.setAttribute('data-profile-grouped', '1');
+
+        // Clean up old profile headers to prevent duplicates on re-group
+        section.querySelectorAll(".timer-profile-hdr").forEach(function(h){ h.remove(); });
 
         // Find all .timer-cab elements
         var cabs = section.querySelectorAll('.timer-cab');
@@ -192,13 +213,40 @@
             return;
         }
 
+        // Smart diff: check if headers already exist in correct order
+        var existingHeaders = section.querySelectorAll('.timer-profile-hdr');
+        var alreadyCorrect = existingHeaders.length === order.length;
+        if (alreadyCorrect) {
+            for (var hi = 0; hi < order.length; hi++) {
+                var hdrText = existingHeaders[hi].textContent || '';
+                if (hdrText.indexOf(order[hi]) === -1) { alreadyCorrect = false; break; }
+            }
+        }
+        if (alreadyCorrect) {
+            // Headers exist and match — only update cab counts, skip DOM reorder
+            existingHeaders.forEach(function(hdr) {
+                var sel = hdr.querySelector('[data-profile-selall]');
+                if (!sel) return;
+                var pn = sel.getAttribute('data-profile-selall');
+                if (groups[pn]) {
+                    var countSpan = hdr.querySelector('span span');
+                    if (countSpan) countSpan.textContent = '(' + groups[pn].length + ' кабінетів)';
+                }
+            });
+            window._timerGrpBusy = false;
+            return;
+        }
+
+        // Remove old headers before re-arranging (prevents orphaned duplicates)
+        existingHeaders.forEach(function(h) { h.parentNode.removeChild(h); });
+
         // Re-arrange: wrap each profile's cabs and insert a header
-        var firstCab = cabs[0];
-        var parent = firstCab.parentNode;
+        // Use DocumentFragment to batch DOM changes (reduces reflow/flicker)
+        var parent = cabs[0].parentNode;
+        var frag = document.createDocumentFragment();
         order.forEach(function(pn){
             try {
-            // Guard: skip if nodes were removed by a concurrent re-render
-            if (!groups[pn] || !groups[pn].length || !groups[pn][0].parentNode) return;
+            if (!groups[pn] || !groups[pn].length) return;
             var header = document.createElement('div');
             header.className = 'timer-profile-hdr';
             header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:10px 14px;margin:14px 0 6px 0;border-radius:8px;background:linear-gradient(90deg,#1e3a5f 0%,#2c5282 100%);color:#fff;font-weight:700;font-size:14px;';
@@ -207,11 +255,12 @@
                 '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;font-weight:600;">' +
                 '<input type="checkbox" data-profile-selall="' + esc(pn) + '" style="cursor:pointer;">' +
                 '<span>Виділити все</span></label>';
-            parent.insertBefore(header, groups[pn][0]);
-            // Move all cabs of this profile to come right after header in order
-            groups[pn].forEach(function(c){ parent.insertBefore(c, header.nextSibling.nextSibling || null); });
-            } catch(e) { console.warn('[CRM_PATCHES] insertBefore skipped for profile ' + pn + ': ' + e.message); }
+            frag.appendChild(header);
+            groups[pn].forEach(function(c){ frag.appendChild(c); });
+            } catch(e) { if(!window._ibWarnCount)window._ibWarnCount=0;window._ibWarnCount++;if(!window._ibWarnLast||Date.now()-window._ibWarnLast>30000){console.warn('[CRM_PATCHES] insertBefore skipped '+window._ibWarnCount+'x (DOM race, non-blocking)');window._ibWarnCount=0;window._ibWarnLast=Date.now();} }
         });
+        // Single DOM operation: append all at once
+        parent.appendChild(frag);
 
         // Bind profile-select-all (re-render-safe: uses cab IDs, not DOM walk)
         section.querySelectorAll('[data-profile-selall]').forEach(function(cb){
@@ -237,7 +286,7 @@
                             sec.removeAttribute('data-profile-grouped');
                             setTimeout(groupTimerCabsByProfile, 100);
                         }
-                        console.log('[PROFILE-SELALL] Selected ' + processed + ' ACTIVE adsets in ' + cabIds.length + ' cabs for ' + pn);
+                        console.log('[PROFILE-SELALL] Selected ' + processed + ' adsets from ACTIVE campaigns in ' + cabIds.length + ' cabs for ' + pn);
                         return;
                     }
                     var cid = cabIds[idx];
@@ -259,8 +308,11 @@
                         var checkboxes = freshCab.querySelectorAll('input[data-adset]');
                         checkboxes.forEach(function(acb){
                             if (on) {
-                                var statusEl = acb.parentElement ? acb.parentElement.querySelector('.timer-status-active') : null;
-                                if (!statusEl) return;
+                                // Check CAMPAIGN status (not adset status) — only select adsets from ACTIVE campaigns
+                                var campDiv = acb.closest('.timer-camp');
+                                if (!campDiv) return;
+                                var campStatusEl = campDiv.querySelector('.timer-camp-meta .timer-status-active');
+                                if (!campStatusEl) return;
                             }
                             if (acb.checked !== on) {
                                 acb.checked = on;
@@ -293,7 +345,7 @@
                     // Headers were destroyed by re-render — clear flag and regroup
                     section.removeAttribute('data-profile-grouped');
                     clearTimeout(_grpTimer);
-                    _grpTimer = setTimeout(groupTimerCabsByProfile, 200);
+                    _grpTimer = setTimeout(groupTimerCabsByProfile, 500);
                 }
             }
         });
@@ -320,7 +372,12 @@
                 if (section) {
                     setTimeout(function(){
                         section.removeAttribute('data-profile-grouped');
-                        groupTimerCabsByProfile();
+                        // Debounce: use rAF to avoid immediate flicker
+                        if (window.requestAnimationFrame) {
+                            window.requestAnimationFrame(groupTimerCabsByProfile);
+                        } else {
+                            setTimeout(groupTimerCabsByProfile, 100);
+                        }
                     }, 50);
                 }
             }
@@ -613,7 +670,8 @@
     // ========================================================================
     function patchSelectAllActiveOnly() {
         // Use event delegation to intercept all select-all clicks in timer section
-        document.addEventListener('click', function(e) {
+        // DISABLED: scheduled_enable_ui.js handles Select All with expand + ACTIVE filter
+        document.addEventListener('click', function(e) { return;
             var t = e.target;
             if (!t) return;
 
@@ -649,20 +707,22 @@
                 scope = group;
             }
 
-            // Select only ACTIVE adsets within scope
+            // Select only adsets from ACTIVE CAMPAIGNS within scope
             var checkboxes = scope.querySelectorAll('input[data-adset]');
             var selected = 0;
             checkboxes.forEach(function(cb) {
-                var statusEl = cb.parentElement ? cb.parentElement.querySelector('.timer-status-active') : null;
-                if (statusEl) {
-                    if (!cb.checked) {
-                        cb.checked = true;
-                        cb.dispatchEvent(new Event('change', {bubbles: true}));
-                        selected++;
-                    }
+                // Check CAMPAIGN status (not adset status)
+                var campDiv = cb.closest('.timer-camp');
+                if (!campDiv) return;
+                var campStatusEl = campDiv.querySelector('.timer-camp-meta .timer-status-active');
+                if (!campStatusEl) return;
+                if (!cb.checked) {
+                    cb.checked = true;
+                    cb.dispatchEvent(new Event('change', {bubbles: true}));
+                    selected++;
                 }
             });
-            console.log('[SELECT-ALL-ACTIVE] ✅ Selected ' + selected + ' ACTIVE adsets out of ' + checkboxes.length + ' total');
+            console.log('[SELECT-ALL-ACTIVE] ✅ Selected ' + selected + ' adsets from ACTIVE campaigns out of ' + checkboxes.length + ' total');
         }, true); // use capture phase to intercept before app.js handlers
 
         console.log('[SELECT-ALL-ACTIVE] ✅ Interceptor wired');

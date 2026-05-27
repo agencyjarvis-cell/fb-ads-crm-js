@@ -499,11 +499,16 @@
                 var cabs = getTopCampaignsByCab();
                 cabs.forEach(function(cab) {
                     if (getProfileForCab(cab.id || 'unknown') === pName) {
+                        _expandedCabs[cab.id || "unknown"] = true;
+                        console.log("[SEL-DEBUG] Expanding cab:", cab.id, "profile:", pName, "expandedCabs:", JSON.stringify(_expandedCabs));
                         cab.campaigns.forEach(function(c) {
-                            (c.adsets || []).forEach(function(a) {
-                                var aId = a.id || a.adset_id;
-                                _selectedAdsets[aId] = { name: a.name || a.adset_name || aId };
-                            });
+                            var campStatus = String(c.campaign_status || c.campaign_effective_status || c.status || "").toUpperCase();
+                            if (campStatus === "ACTIVE") {
+                                (c.adsets || []).forEach(function(a) {
+                                    var aId = a.id || a.adset_id;
+                                    _selectedAdsets[aId] = { name: a.name || a.adset_name || aId };
+                                });
+                            }
                         });
                     }
                 });

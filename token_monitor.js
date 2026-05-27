@@ -11,6 +11,9 @@
     var ERROR_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
     var CHECK_INTERVAL_MS = 30 * 1000;    // check every 30s
 
+    var _warnThrottle = {}; // url -> last warn timestamp
+    function shouldWarn(url) { var k = url.split('?')[0]; var n = Date.now(); if (_warnThrottle[k] && n - _warnThrottle[k] < 60000) return false; _warnThrottle[k] = n; return true; }
+
     window._tokenErrorStats = {
         totalRequests: 0,
         tokenErrors: 0,         // 401/403
@@ -71,10 +74,10 @@
 
             if (status === 401 || status === 403) {
                 recordEvent('token_error', status, urlStr);
-                console.warn('[TOKEN-MON] 🔴 Token error ' + status + ' on ' + urlStr);
+                if (shouldWarn(urlStr)) console.warn('[TOKEN-MON] 🔴 Token error ' + status + ' on ' + urlStr + ' (throttled 60s)');
             } else if (status >= 500) {
                 recordEvent('server_error', status, urlStr);
-                console.warn('[TOKEN-MON] 🟡 Server error ' + status + ' on ' + urlStr);
+                if (shouldWarn(urlStr)) console.warn('[TOKEN-MON] 🟡 Server error ' + status + ' on ' + urlStr + ' (throttled 60s)');
             } else if (status >= 200 && status < 400) {
                 recordEvent('success', status, urlStr);
             }
@@ -82,7 +85,7 @@
             return response;
         }).catch(function(error) {
             recordEvent('server_error', 0, urlStr);
-            console.warn('[TOKEN-MON] 🟡 Network error on ' + urlStr + ': ' + error.message);
+            if (shouldWarn(urlStr)) console.warn('[TOKEN-MON] 🟡 Network error on ' + urlStr + ': ' + error.message);
             throw error;
         });
     };
