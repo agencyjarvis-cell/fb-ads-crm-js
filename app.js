@@ -3482,7 +3482,7 @@
 
                 console.log(`✅ [AFK] Перевірки пройдено, запускаю АФК режим...`);
                 isAutoRefreshActive = true;
-                // 🔧 FIX: Скидаємо паузи при увімкненні АФК (щоб всі кабінети були активні)
+                // FIX: clear paused on AFK enable
                 clearCabinetsPausedState();
                 if (statusDiv) statusDiv.style.display = 'block';
                 startAutoRefresh(interval);
@@ -3934,7 +3934,7 @@
                 return;
             }
 
-            // 🔧 FIX: Скидаємо паузи при перепроходженні кроку 3
+            // FIX: clear paused on step3 re-pass
             clearCabinetsPausedState();
             // ✅ ВИПРАВЛЕННЯ: Синхронізуємо cabinetsToUpdate з поточним selectedAdaccounts
             // Видаляємо кабінети які більше не вибрані на Кроці 2
@@ -4073,12 +4073,11 @@
             console.log('⏸️ Скинуто всі паузи');
         }
 
-        // 🔧 FIX: Bridge for scheduled_enable.js to un-pause specific cabinet
         window.unpauseCabinetForAfk = function(cabinetId) {
             if (cabinetsPaused.has(cabinetId)) {
                 cabinetsPaused.delete(cabinetId);
                 saveCabinetsPausedState();
-                console.log('🔓 Un-paused cabinet' + cabinetId + 'from AFK (scheduled enable)');
+                console.log('Un-paused cabinet ' + cabinetId + ' from AFK');
             }
         };
 
