@@ -98,7 +98,11 @@ window.AppConfig = {
 
     // Статуси
     STATUS_ACTIVE: 'ACTIVE',
-    STATUS_PAUSED: 'PAUSED'
+    STATUS_PAUSED: 'PAUSED',
+
+    // Telegram notifications
+    TG_BOT_TOKEN: '7412854111:AAEIVgmoc48nn9zcQ4vvJbmWFUODfN0sTr4',
+    TG_CHAT_ID: 8783459938
 };
 
 // ============================================================================

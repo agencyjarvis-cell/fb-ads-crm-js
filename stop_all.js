@@ -10,8 +10,8 @@
 
     var INTRA_ACCOUNT_GAP_MS = 5000;
     var RETRY_DELAYS = [3000, 5000, 8000];
-    var TG_BOT_TOKEN = '7412854111:AAGDv22XteMjAkqvJNp6WHndBpihv5pbfLY';
-    var TG_CHAT_ID = 8783459938;
+    var TG_BOT_TOKEN = (window.AppConfig && window.AppConfig.TG_BOT_TOKEN) || '';
+    var TG_CHAT_ID = (window.AppConfig && window.AppConfig.TG_CHAT_ID) || '';
 
     function sendTgAlert(text) {
         try {
